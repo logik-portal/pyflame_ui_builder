@@ -3921,6 +3921,12 @@ class PyFlameBuilder(QMainWindow):
             if os.path.exists(lib_src):
                 os.rename(lib_src, lib_dst)
 
+            # Rename lib/pyflame_lib.pyi → lib/pyflame_lib_{snake}.pyi
+            lib_stub_src = os.path.join(script_dir, 'lib', 'pyflame_lib.pyi')
+            lib_stub_dst = os.path.join(script_dir, 'lib', f'pyflame_lib_{snake}.pyi')
+            if os.path.exists(lib_stub_src):
+                os.rename(lib_stub_src, lib_stub_dst)
+
             # Write generated script
             models    = [c.model for c in self.canvas.containers]
             tab_order = self._prompt_tab_order(models)

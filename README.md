@@ -48,7 +48,11 @@ python3 pyflame_ui_builder.py
 4. Preview generated code (optional).
 5. Generate script via **File → Generate Script...**. Set the Flame Python path as the location. Commonly /opt/Autodesk/shared/python.
 6. Start Flame to preview the new window.
-7. Add custom logic to widgets/script in code editor of your choice.
+7. Add custom logic to widgets/script in code editor of your choice. A stub file for the pyflame library is included with the script to assist working with the widgets in your code editor.
+
+## Example files
+
+Two example files can be loaded from /pyflame_ui_builder/examples
 
 ## Screenshots
 
@@ -63,6 +67,7 @@ python3 pyflame_ui_builder.py
 ## Note
 
 Files created by **File → Save** are not meant to be loaded into Flame. They are just project files for PyFlame UI Builder.
+To create a script that can be loaded in Flame go to **File → Generate Script...**.
 
 ## Canvas controls
 
