@@ -1,0 +1,190 @@
+{
+  "config": {
+    "script_name": "PDF to JPG",
+    "written_by": "Mike",
+    "script_version": "v1.0.0",
+    "flame_version": "2025.1",
+    "hook_types": [
+      "get_media_panel_custom_ui_actions"
+    ],
+    "license_type": "GPL-3.0",
+    "grid_columns": 4,
+    "grid_rows": 7,
+    "column_width": 150,
+    "row_height": 28
+  },
+  "widgets": [
+    {
+      "widget_type": "PyFlameLabel",
+      "row": 1,
+      "col": 0,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "PDF Path",
+        "style": "NORMAL",
+        "align": "LEFT"
+      },
+      "var_name": "pdf_path_label"
+    },
+    {
+      "widget_type": "PyFlameLabel",
+      "row": 2,
+      "col": 0,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Image Layout",
+        "style": "NORMAL",
+        "align": "LEFT"
+      },
+      "var_name": "image_layout_label"
+    },
+    {
+      "widget_type": "PyFlameEntry",
+      "row": 1,
+      "col": 1,
+      "row_span": 1,
+      "col_span": 3,
+      "properties": {
+        "text": "",
+        "placeholder_text": "",
+        "read_only": true,
+        "text_changed": null,
+        "tooltip": ""
+      },
+      "var_name": "pdf_path_entry"
+    },
+    {
+      "widget_type": "PyFlameLabel",
+      "row": 2,
+      "col": 2,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Image Resolution (DPI)",
+        "style": "NORMAL",
+        "align": "LEFT"
+      },
+      "var_name": "image_resolution_label"
+    },
+    {
+      "widget_type": "PyFlameSlider",
+      "row": 2,
+      "col": 3,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "min_value": 150,
+        "max_value": 151,
+        "start_value": 150,
+        "connect": null
+      },
+      "var_name": "resolution_slider"
+    },
+    {
+      "widget_type": "PyFlamePushButton",
+      "row": 4,
+      "col": 2,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Add Page Number",
+        "checked": false,
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "add_page_number_push_button"
+    },
+    {
+      "widget_type": "PyFlameButton",
+      "row": 6,
+      "col": 2,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Cancel",
+        "color": "GRAY",
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "cancel_button"
+    },
+    {
+      "widget_type": "PyFlameButton",
+      "row": 6,
+      "col": 3,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Convert",
+        "color": "BLUE",
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "convert_button"
+    },
+    {
+      "widget_type": "PyFlameMenu",
+      "row": 2,
+      "col": 1,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Single",
+        "menu_options": [
+          "2x2",
+          "4",
+          "Option 3"
+        ],
+        "align": "LEFT",
+        "menu_indicator": false,
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "image_layout_menu"
+    },
+    {
+      "widget_type": "PyFlamePushButton",
+      "row": 4,
+      "col": 1,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Reveal in Finder",
+        "checked": false,
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "reveal_in_finder_push_button"
+    },
+    {
+      "widget_type": "PyFlamePushButton",
+      "row": 4,
+      "col": 0,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Reveal in MediaHub",
+        "checked": false,
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "reveal_in_mediahub_push_button"
+    },
+    {
+      "widget_type": "PyFlamePushButton",
+      "row": 4,
+      "col": 3,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Import JPGs",
+        "checked": false,
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "import_jpg_push_button"
+    }
+  ]
+}

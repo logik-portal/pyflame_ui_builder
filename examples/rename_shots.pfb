@@ -1,0 +1,128 @@
+{
+  "config": {
+    "script_name": "Rename Shots",
+    "written_by": "Mike",
+    "script_version": "v1.0.0",
+    "flame_version": "2025.1",
+    "hook_types": [
+      "get_timeline_custom_ui_actions"
+    ],
+    "license_type": "GPL-3.0",
+    "grid_columns": 4,
+    "grid_rows": 5,
+    "column_width": 150,
+    "row_height": 28
+  },
+  "widgets": [
+    {
+      "widget_type": "PyFlameButton",
+      "row": 4,
+      "col": 2,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Cancel",
+        "color": "GRAY",
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "cancel_button"
+    },
+    {
+      "widget_type": "PyFlameButton",
+      "row": 4,
+      "col": 3,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Apply",
+        "color": "BLUE",
+        "connect": null,
+        "tooltip": ""
+      },
+      "var_name": "apply_button"
+    },
+    {
+      "widget_type": "PyFlameEntry",
+      "row": 1,
+      "col": 1,
+      "row_span": 1,
+      "col_span": 2,
+      "properties": {
+        "text": "",
+        "placeholder_text": "",
+        "read_only": false,
+        "text_changed": null,
+        "tooltip": ""
+      },
+      "var_name": "clip_name_entry"
+    },
+    {
+      "widget_type": "PyFlameLabel",
+      "row": 1,
+      "col": 0,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Clip Name",
+        "style": "NORMAL",
+        "align": "LEFT"
+      },
+      "var_name": "clip_name_label"
+    },
+    {
+      "widget_type": "PyFlameLabel",
+      "row": 2,
+      "col": 0,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Shot Name",
+        "style": "NORMAL",
+        "align": "LEFT"
+      },
+      "var_name": "shot_name_label"
+    },
+    {
+      "widget_type": "PyFlameEntry",
+      "row": 2,
+      "col": 1,
+      "row_span": 1,
+      "col_span": 2,
+      "properties": {
+        "text": "",
+        "placeholder_text": "",
+        "read_only": false,
+        "text_changed": null,
+        "tooltip": ""
+      },
+      "var_name": "shot_name_entry"
+    },
+    {
+      "widget_type": "PyFlameTokenMenu",
+      "row": 1,
+      "col": 3,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Add Token",
+        "token_dest": null,
+        "tooltip": ""
+      },
+      "var_name": "tokenmenu_1"
+    },
+    {
+      "widget_type": "PyFlameTokenMenu",
+      "row": 2,
+      "col": 3,
+      "row_span": 1,
+      "col_span": 1,
+      "properties": {
+        "text": "Add Token",
+        "token_dest": null,
+        "tooltip": ""
+      },
+      "var_name": "tokenmenu_2"
+    }
+  ]
+}
