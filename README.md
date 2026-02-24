@@ -15,7 +15,7 @@ By default windows created with this script will close inside of Flame by hittin
 
 ## Platform Support
 
-- **Runs MacOS only**
+- **Runs on MacOS only**
 - Generated scripts work on Mac and Linux
 
 ## Requirements
@@ -26,8 +26,7 @@ By default windows created with this script will close inside of Flame by hittin
 
 ## Help
 
-Use the in-app Help:
-- **Help → Open Help Center**
+**Available in the **Help** menu.
 
 Help content is sourced from:
 - `docs/help/getting-started.md`
