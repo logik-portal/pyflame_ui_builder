@@ -26,7 +26,7 @@ By default windows created with this script will close inside of Flame by hittin
 
 ## Help
 
-**Available in the **Help** menu.
+- Available in the **Help** menu.
 
 Help content is sourced from:
 - `docs/help/getting-started.md`
