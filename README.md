@@ -3,7 +3,7 @@
 **Version:** 1.0.0<br>
 **Author:** Michael Vaglienty<br>
 **License:** GPL-3.0<br>
-**GitHub:** https://github.com/logik-portal/PyFlame-UI-Builder<br>
+**GitHub:** https://github.com/logik-portal/pyflame-ui-builder<br>
 
 A desktop UI builder for Autodesk Flame Python scripts.
 
