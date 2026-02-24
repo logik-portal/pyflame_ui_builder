@@ -7,7 +7,7 @@
 
 A desktop UI builder for Autodesk Flame Python scripts.
 
-Generates a ready-to-use Flame script with custom UI.
+Generates a ready-to-use Flame script with custom UI built from PyFlame UI widgets.
 
 **Script logic will need to be added after creation.**
 
