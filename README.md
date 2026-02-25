@@ -29,7 +29,7 @@ By default windows created with this script will close inside of Flame by hittin
 Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ## Run
