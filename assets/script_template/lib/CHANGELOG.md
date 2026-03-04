@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 https://github.com/logik-portal/pyflame
 
+## v5.2.4 [02.28.26]
+
+### Updates
+
+- **Widgets**
+    -`PyFlameWindow`
+        - Added argument for window margins - defaults to 15.
+
 ## v5.2.3 [02.24.26]
 
 ### Updates/Fixes

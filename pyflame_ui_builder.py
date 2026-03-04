@@ -32,6 +32,8 @@ _flame_mock.projects = types.SimpleNamespace(
 for _cls in ['PyBatch', 'PyClip', 'PyFolder', 'PyLibrary', 'PySequence',
              'PySegment', 'PyTrack', 'PyTimeline', 'PyDesktop', 'PyNode']:
     setattr(_flame_mock, _cls, type(_cls, (), {}))
+# pyflame_lib expects flame.messages.show_in_console when reporting warnings.
+_flame_mock.messages = types.SimpleNamespace(show_in_console=lambda *args, **kwargs: None)
 sys.modules['flame'] = _flame_mock
 
 # ==============================================================================
@@ -40,17 +42,49 @@ sys.modules['flame'] = _flame_mock
 
 import os
 import re
-import json
+import ast
+import html
 import copy
+import json
+import queue
 import shutil
 import datetime
-import logging
 import subprocess
 import importlib.util
-import traceback
-from logging.handlers import RotatingFileHandler
-from collections import namedtuple
-from dataclasses import dataclass, field
+import threading
+import textwrap
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from app.config import (
+    APP_NAME,
+    APP_VERSION,
+    APP_AUTHOR,
+    APP_LICENSE,
+    APP_URL,
+    APP_DESCRIPTION,
+)
+from app.logging_setup import get_bootstrap_logger, init_logging
+from models.ui_models import PropDef, PlacedWidget, ScriptWindow, WindowConfig
+from services.code_generator import CodeGenerator
+from services.project_serializer import ProjectSerializer
+from services.script_analysis import (
+    analyze_create_windows,
+    detect_classes,
+)
+from services.utils import to_snake
+from services.workflow import (
+    build_imported_windows,
+    summarize_import_result,
+    suggest_script_name_from_path,
+)
+from services.export_workflow import prepare_export_tree, decide_export_code
+from ui.canvas_widget import CanvasWidget
+from ui.help_dialog import HelpDialog
+from ui.pannable_scroll_area import PannableScrollArea
+from ui.progress_bar_preview import ProgressBarPreview
+from ui.properties_panel import PropertiesPanel
+from ui.widget_container import TabOrderDialog, WidgetContainer
+from ui.widget_palette import WidgetPalette
+from ui.window_config_bar import WindowConfigBar
 
 # ==============================================================================
 # Platform Guard
@@ -71,37 +105,26 @@ if sys.platform != 'darwin':
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QScrollArea, QListWidget, QListWidgetItem, QLabel, QLineEdit,
-    QSpinBox, QComboBox, QCheckBox, QSplitter, QFrame, QDialog,
-    QPlainTextEdit, QPushButton, QFileDialog, QMessageBox,
-    QFormLayout, QGroupBox, QAbstractItemView, QSizePolicy, QMenu, QTextEdit,
-    QTextBrowser,
+    QLabel, QLineEdit, QComboBox, QCheckBox, QSplitter, QFrame, QDialog,
+    QPlainTextEdit, QPushButton, QFileDialog, QMessageBox, QTextEdit,
+    QInputDialog, QTabBar, QMenu, QTextBrowser,
 )
-from PySide6.QtCore import Qt, QPoint, QRect, QSize, QMimeData, Signal, QSettings, QTimer, QRegularExpression
+from PySide6.QtCore import Qt, QRect, QSettings, QTimer, QEvent, Signal, QSize, QPoint, QThread
 from PySide6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QDrag, QFont, QFontDatabase, QKeySequence, QAction,
-    QTextCursor, QTextFormat, QRegularExpressionValidator,
+    QColor, QFont, QFontDatabase, QKeySequence, QAction, QCursor, QPainter, QPolygon,
+    QTextCursor, QTextFormat, QTextDocument, QSyntaxHighlighter, QTextCharFormat, QTextBlock,
 )
+
+from ui.code_editor import SpacesTabPlainTextEdit, PythonSyntaxHighlighter
+
 
 # ==============================================================================
 # QApplication must exist before pyflame_lib loads (it calls screenGeometry() at
 # module level via _load_font() → pyflame.gui_resize() → pyflame.window_resolution())
 # ==============================================================================
 
-APP_NAME = 'PyFlame UI Builder'
-APP_VERSION = '1.0.0'
-APP_AUTHOR = 'Michael Vaglienty'
-APP_LICENSE = 'GPL-3.0'
-APP_URL = 'https://github.com/logik-portal/PyFlame-UI-Builder'
-APP_DESCRIPTION = 'Visual UI builder for Autodesk Flame Python scripts.'
-
 # Bootstrap logger so early module-load events are visible in terminal.
-_bootstrap_logger = logging.getLogger('pyflame_builder')
-_bootstrap_logger.setLevel(logging.INFO)
-if not _bootstrap_logger.handlers:
-    _h = logging.StreamHandler(sys.stdout)
-    _h.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s'))
-    _bootstrap_logger.addHandler(_h)
+_bootstrap_logger = get_bootstrap_logger()
 
 _early_app = QApplication.instance() or QApplication(sys.argv)
 _early_app.setApplicationName(APP_NAME)
@@ -143,6 +166,27 @@ try:
     for _n in _PYFLAME_EXPORTS:
         if hasattr(_pyflame_mod, _n):
             globals()[_n] = getattr(_pyflame_mod, _n)
+
+    # In builder preview mode, pyflame widgets can create helper dialogs
+    # (e.g. entry calculator) with a Qt parent that is not a PyFlameWindow.
+    # That strict type check is valid in Flame, but too strict for this host app.
+    try:
+        _orig_raise_type_error = _pyflame_mod.pyflame.raise_type_error
+
+        def _builder_safe_raise_type_error(*args, **kwargs):
+            cls_name = args[0] if len(args) > 0 else kwargs.get('class_name')
+            arg_name = args[1] if len(args) > 1 else kwargs.get('arg_name')
+            if cls_name == 'PyFlameWindow' and arg_name == 'parent':
+                _bootstrap_logger.debug(
+                    'Suppressed PyFlameWindow parent type error in builder preview context.'
+                )
+                return
+            return _orig_raise_type_error(*args, **kwargs)
+
+        _pyflame_mod.pyflame.raise_type_error = _builder_safe_raise_type_error
+    except Exception:
+        _bootstrap_logger.debug('Could not install builder-safe pyflame type-check shim.')
+
     _pyflame_loaded = True
     _bootstrap_logger.info('pyflame_lib loaded successfully.')
 except Exception as _e:
@@ -150,47 +194,10 @@ except Exception as _e:
     _bootstrap_logger.exception('pyflame_lib import traceback')
 
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'script_template')
+CHANGELOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'CHANGELOG.md')
 
-
-def _to_snake(name: str) -> str:
-    """Convert a script name to a safe lowercase_underscore identifier.
-    Replaces any run of non-alphanumeric characters with a single underscore."""
-    name = name.lower()
-    name = re.sub(r'[^a-z0-9]+', '_', name)
-    name = name.strip('_')
-    return name or 'script'
-
-# ==============================================================================
-# Data Models
-# ==============================================================================
-
-PropDef = namedtuple('PropDef', ['name', 'kind', 'default', 'options'])
-
-
-@dataclass
-class PlacedWidget:
-    widget_type: str
-    row: int
-    col: int
-    row_span: int = 1
-    col_span: int = 1
-    properties: dict = field(default_factory=dict)
-    var_name: str = ''
-
-
-@dataclass
-class WindowConfig:
-    script_name: str = 'My Script'
-    written_by: str = 'Your Name'
-    script_version: str = 'v1.0.0'
-    flame_version: str = '2025.1'
-    hook_types: list = field(default_factory=lambda: ['get_batch_custom_ui_actions'])
-    license_type: str = 'GPL-3.0'
-    grid_columns: int = 4
-    grid_rows: int = 3
-    column_width: int = 150
-    row_height: int = 28
-
+# Local preview API toggle for builder runtime (can still be overridden by env vars below).
+PREVIEW_API_ENABLED = False
 
 # ==============================================================================
 # License Data
@@ -544,6 +551,19 @@ WIDGET_SPECS = {
             PropDef('update_connect', 'connect', None, []),
         ],
     },
+    'PyFlameTable': {
+        'display': 'Table',
+        'category': 'Collections',
+        'fixed_axes': set(),
+        'props': [
+            PropDef('csv_file_path', 'str', '', []),
+            PropDef('alternating_row_colors', 'bool', True, []),
+            PropDef('enabled', 'bool', True, []),
+            PropDef('tooltip', 'str', '', []),
+            PropDef('tooltip_delay', 'int', 3, []),
+            PropDef('tooltip_duration', 'int', 5, []),
+        ],
+    },
     'PyFlameTextEdit': {
         'display': 'Text Edit',
         'category': 'Input',
@@ -580,7 +600,7 @@ WIDGET_SPECS = {
         'fixed_axes': {'h'},
         'props': [
             PropDef('color', 'enum', 'GRAY',
-                    ['GRAY', 'BLUE', 'RED', 'YELLOW', 'GREEN', 'TEAL']),
+                    ['BLACK', 'WHITE', 'GRAY', 'BRIGHT_GRAY', 'BLUE', 'RED']),
         ],
     },
     'PyFlameVerticalLine': {
@@ -589,7 +609,7 @@ WIDGET_SPECS = {
         'fixed_axes': {'w'},
         'props': [
             PropDef('color', 'enum', 'GRAY',
-                    ['GRAY', 'BLUE', 'RED', 'YELLOW', 'GREEN', 'TEAL']),
+                    ['BLACK', 'WHITE', 'GRAY', 'BRIGHT_GRAY', 'BLUE', 'RED']),
         ],
     },
 }
@@ -614,6 +634,16 @@ ENUM_PROP_MAP = {
     'text_type': 'TextType',
     'text_style': 'TextStyle',
 }
+
+CodeGenerator.configure(
+    template_dir=TEMPLATE_DIR,
+    license_data=LICENSE_DATA,
+    widget_specs=WIDGET_SPECS,
+    hook_to_type=HOOK_TO_TYPE,
+    hook_scope=HOOK_SCOPE,
+    scope_defs=SCOPE_DEFS,
+    enum_prop_map=ENUM_PROP_MAP,
+)
 
 
 # ==============================================================================
@@ -737,2062 +767,17 @@ def _make_fallback_widget(widget_type):
     return lbl
 
 
-# ==============================================================================
-# TabOrderDialog
-# ==============================================================================
-
-class TabOrderDialog(QDialog):
-    """Ask the user whether to include tab_order and in what sequence."""
-
-    def __init__(self, entries: list, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle('Tab Order')
-        self.setModal(True)
-        self.setMinimumWidth(320)
-        self.setStyleSheet(
-            'QDialog { background: #2d2d2d; }'
-            'QLabel  { color: #c8c8c8; }'
-            'QListWidget { background: #1e1e1e; color: #c8c8c8;'
-            '              border: 1px solid #555; outline: none; }'
-            'QListWidget::item { padding: 4px 8px; }'
-            'QListWidget::item:selected { background: #0078d7; }'
-            'QPushButton { background: #3a3a3a; color: #c8c8c8; border: none;'
-            '              padding: 4px 14px; border-radius: 2px; }'
-            'QPushButton:hover { background: #4a4a4a; }'
-        )
-
-        layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-        layout.setContentsMargins(16, 16, 16, 16)
-
-        info = QLabel(
-            f'{len(entries)} entry widgets found.\n'
-            'Drag items or use the arrows to set the tab order.'
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        self._list = QListWidget()
-        self._list.setDragDropMode(QAbstractItemView.InternalMove)
-        self._list.setDefaultDropAction(Qt.MoveAction)
-        for e in entries:
-            self._list.addItem(e.var_name or 'entry')
-        layout.addWidget(self._list)
-
-        arrow_row = QHBoxLayout()
-        up_btn   = QPushButton('▲  Up')
-        down_btn = QPushButton('▼  Down')
-        up_btn.clicked.connect(self._move_up)
-        down_btn.clicked.connect(self._move_down)
-        arrow_row.addWidget(up_btn)
-        arrow_row.addWidget(down_btn)
-        arrow_row.addStretch()
-        layout.addLayout(arrow_row)
-
-        btn_row = QHBoxLayout()
-        ok_btn     = QPushButton('Include Tab Order')
-        ok_btn.setStyleSheet('background: #0078d7; color: white; padding: 4px 16px;')
-        ok_btn.clicked.connect(self.accept)
-        skip_btn   = QPushButton('Skip')
-        skip_btn.clicked.connect(self.reject)
-        btn_row.addStretch()
-        btn_row.addWidget(ok_btn)
-        btn_row.addWidget(skip_btn)
-        layout.addLayout(btn_row)
-
-    def _move_up(self):
-        row = self._list.currentRow()
-        if row > 0:
-            item = self._list.takeItem(row)
-            self._list.insertItem(row - 1, item)
-            self._list.setCurrentRow(row - 1)
-
-    def _move_down(self):
-        row = self._list.currentRow()
-        if row < self._list.count() - 1:
-            item = self._list.takeItem(row)
-            self._list.insertItem(row + 1, item)
-            self._list.setCurrentRow(row + 1)
-
-    def ordered_vars(self) -> list[str]:
-        return [self._list.item(i).text() for i in range(self._list.count())]
-
-
-# ==============================================================================
-# MoveResizeDialog
-# ==============================================================================
-
-class MoveResizeDialog(QDialog):
-    """Dialog for setting a widget's grid position and span."""
-
-    def __init__(self, container, canvas):
-        super().__init__(canvas)
-        self.container = container
-        self.canvas    = canvas
-        m   = container.model
-        cfg = canvas.config
-
-        self.setWindowTitle('Move / Resize')
-        self.setModal(True)
-        self.setStyleSheet(
-            'QDialog { background: #2d2d2d; }'
-            'QLabel  { color: #c8c8c8; }'
-            'QSpinBox { background: #3a3a3a; border: 1px solid #555;'
-            '           color: #c8c8c8; padding: 2px; }'
-            'QPushButton { padding: 4px 16px; color: white; border: none; border-radius: 2px; }'
-        )
-
-        form = QFormLayout(self)
-        form.setContentsMargins(16, 16, 16, 16)
-        form.setSpacing(8)
-
-        self._row     = QSpinBox(); self._row.setRange(0, cfg.grid_rows - 1);     self._row.setValue(m.row)
-        self._col     = QSpinBox(); self._col.setRange(0, cfg.grid_columns - 1);  self._col.setValue(m.col)
-        self._rowspan = QSpinBox(); self._rowspan.setRange(1, cfg.grid_rows);      self._rowspan.setValue(m.row_span)
-        self._colspan = QSpinBox(); self._colspan.setRange(1, cfg.grid_columns);   self._colspan.setValue(m.col_span)
-
-        fixed = WIDGET_SPECS.get(m.widget_type, {}).get('fixed_axes', set())
-        if 'h' in fixed:
-            self._rowspan.setValue(1)
-            self._rowspan.setEnabled(False)
-        if 'w' in fixed:
-            self._colspan.setValue(1)
-            self._colspan.setEnabled(False)
-
-        form.addRow('Row:',      self._row)
-        form.addRow('Column:',   self._col)
-        if not ({'h', 'w'} <= set(fixed)):
-            form.addRow('Row Span:', self._rowspan)
-            form.addRow('Col Span:', self._colspan)
-
-        btn_row = QHBoxLayout()
-        apply_btn  = QPushButton('Apply')
-        apply_btn.setStyleSheet('background: #0078d7;')
-        apply_btn.clicked.connect(self._apply)
-        cancel_btn = QPushButton('Cancel')
-        cancel_btn.setStyleSheet('background: #555;')
-        cancel_btn.clicked.connect(self.reject)
-        btn_row.addStretch()
-        btn_row.addWidget(apply_btn)
-        btn_row.addWidget(cancel_btn)
-        form.addRow(btn_row)
-
-    def _apply(self):
-        m   = self.container.model
-        cfg = self.canvas.config
-        row      = min(self._row.value(),     cfg.grid_rows    - 1)
-        col      = min(self._col.value(),     cfg.grid_columns - 1)
-        row_span = min(self._rowspan.value(), cfg.grid_rows    - row)
-        col_span = min(self._colspan.value(), cfg.grid_columns - col)
-        m.row, m.col           = row, col
-        m.row_span, m.col_span = row_span, col_span
-        self.container.setGeometry(self.canvas.cell_rect(row, col, row_span, col_span))
-        self.canvas.widget_moved.emit(self.container)
-        self.accept()
-
-
-# ==============================================================================
-# WidgetOverlay
-# ==============================================================================
-
-class WidgetOverlay(QWidget):
-    """
-    Transparent overlay covering the entire WidgetContainer.
-
-    Interaction model:
-      • Left-click  → selects widget (properties panel) then forwards the click
-                       to the real PyFlame widget so it stays fully interactive.
-      • Right-drag  → moves the container freely; release snaps to grid.
-      • Right-drag on a handle → resizes; release snaps to grid.
-    """
-
-    _CURSOR_MAP = {
-        'nw': Qt.SizeFDiagCursor, 'se': Qt.SizeFDiagCursor,
-        'ne': Qt.SizeBDiagCursor, 'sw': Qt.SizeBDiagCursor,
-        'n':  Qt.SizeVerCursor,   's':  Qt.SizeVerCursor,
-        'e':  Qt.SizeHorCursor,   'w':  Qt.SizeHorCursor,
-    }
-
-    def __init__(self, container):
-        super().__init__(container)
-        self.container  = container
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setMouseTracking(True)
-        self._mode         = None   # None | 'move' | handle_id
-        self._press_pos    = None
-        self._press_geom   = None
-        self._rclick_pos   = None   # global pos of RMB press (before drag starts)
-        self._rclick_local = None   # local pos of RMB press
-        self._drag_started = False  # True once RMB drag threshold is crossed
-
-    # ── painting ──────────────────────────────────────────────────────────────
-
-    def paintEvent(self, event):
-        if not self.container.selected:
-            return
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
-
-        # Blue dashed border
-        p.setPen(QPen(QColor(0, 120, 215), 2, Qt.DashLine))
-        p.setBrush(Qt.NoBrush)
-        p.drawRect(self.rect().adjusted(1, 1, -2, -2))
-
-        # Resize handles — only draw handles valid for this widget type
-        allowed = _allowed_handle_ids(self.container.model.widget_type)
-        p.setPen(QPen(QColor(0, 100, 200), 1))
-        p.setBrush(QBrush(QColor(255, 255, 255)))
-        for hid, hr in _handle_rects(self.rect()).items():
-            if hid in allowed:
-                p.drawRect(hr)
-
-        # Grid position hint in top-right corner
-        m = self.container.model
-        coord_hint = f'R{m.row + 1} C{m.col + 1}'
-        if m.row_span > 1 or m.col_span > 1:
-            coord_hint += f' · {m.row_span}×{m.col_span}'
-        p.setPen(QPen(QColor(0, 120, 215, 180), 1))
-        p.setFont(QFont('Arial', 7))
-        p.drawText(self.rect().adjusted(0, 0, -3, 0),
-                   Qt.AlignTop | Qt.AlignRight, coord_hint)
-        p.end()
-
-    # ── hit-testing ───────────────────────────────────────────────────────────
-
-    def _hit_test(self, pos):
-        allowed = _allowed_handle_ids(self.container.model.widget_type)
-        for hid, hr in _handle_rects(self.rect()).items():
-            if hid in allowed and hr.contains(pos):
-                return hid
-        return None
-
-    # ── overlay mouse events (left-drag = move/resize, right-click = menu) ──
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            # Record position; defer drag start until mouse moves past threshold
-            self._rclick_pos   = event.globalPosition().toPoint()
-            self._rclick_local = event.position().toPoint()
-            self._drag_started = False
-            self.container.canvas.select_widget(self.container)
-            event.accept()
-        elif event.button() == Qt.RightButton:
-            self.container.canvas.select_widget(self.container)
-            self._show_context_menu(event.globalPosition().toPoint())
-            event.accept()
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() & Qt.LeftButton:
-            if self._rclick_pos is not None and not self._drag_started:
-                moved = (event.globalPosition().toPoint() - self._rclick_pos).manhattanLength()
-                if moved > 5:
-                    self._start_drag(self._rclick_pos, self._rclick_local)
-                    self._drag_started = True
-            if self._mode is not None:
-                self._do_move(event.globalPosition().toPoint())
-            event.accept()
-        else:
-            # Update cursor: resize cursor over handles, arrow elsewhere
-            handle = self._hit_test(event.position().toPoint())
-            if handle:
-                self.setCursor(self._CURSOR_MAP.get(handle, Qt.ArrowCursor))
-            else:
-                self.unsetCursor()
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            if self._drag_started and self._mode is not None:
-                self._finish_drag()
-            self._rclick_pos   = None
-            self._rclick_local = None
-            self._drag_started = False
-        event.accept()
-
-    # ── event filter (fallback: catches events when pyflame widget is on top) ─
-
-    def eventFilter(self, obj, event):
-        from PySide6.QtCore import QEvent
-        t = event.type()
-
-        if t == QEvent.MouseButtonPress:
-            if event.button() == Qt.LeftButton:
-                global_pos = obj.mapToGlobal(event.position().toPoint())
-                local_pos  = self.mapFromGlobal(global_pos)
-                self._rclick_pos   = global_pos
-                self._rclick_local = local_pos
-                self._drag_started = False
-                self.container.canvas.select_widget(self.container)
-                return True
-            if event.button() == Qt.RightButton:
-                self.container.canvas.select_widget(self.container)
-                global_pos = obj.mapToGlobal(event.position().toPoint())
-                self._show_context_menu(global_pos)
-                return True
-
-        if t == QEvent.MouseMove:
-            if event.buttons() & Qt.LeftButton:
-                if self._rclick_pos is not None and not self._drag_started:
-                    global_pos = obj.mapToGlobal(event.position().toPoint())
-                    moved = (global_pos - self._rclick_pos).manhattanLength()
-                    if moved > 5:
-                        self._start_drag(self._rclick_pos, self._rclick_local)
-                        self._drag_started = True
-                if self._mode is not None:
-                    global_pos = obj.mapToGlobal(event.position().toPoint())
-                    self._do_move(global_pos)
-                    return True
-            return False
-
-        if t == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
-            if self._drag_started and self._mode is not None:
-                self._finish_drag()
-            self._rclick_pos   = None
-            self._rclick_local = None
-            self._drag_started = False
-            return True
-
-        return False
-
-    # ── drag logic ────────────────────────────────────────────────────────────
-
-    def _start_drag(self, global_pos, local_pos):
-        handle = self._hit_test(local_pos)
-        self._mode       = handle if handle else 'move'
-        self._press_pos  = global_pos
-        self._press_geom = self.container.geometry()
-        self.container.canvas.select_widget(self.container)
-        if self._mode == 'move':
-            self.setCursor(Qt.SizeAllCursor)
-        else:
-            self.setCursor(self._CURSOR_MAP.get(self._mode, Qt.SizeAllCursor))
-
-    def _do_move(self, global_pos):
-        delta = global_pos - self._press_pos
-        if self._mode == 'move':
-            self.container.move(self._press_geom.topLeft() + delta)
-        else:
-            self._apply_resize(delta, self._press_geom)
-
-    def _finish_drag(self):
-        self._snap_to_grid()
-        self._mode       = None
-        self._press_pos  = None
-        self._press_geom = None
-        self.unsetCursor()
-        self.container.canvas.widget_moved.emit(self.container)
-
-    # ── forward left-click to the real widget ─────────────────────────────────
-
-    def _forward_event(self, event):
-        """Send a cloned mouse event to the appropriate child of pyflame_widget."""
-        from PySide6.QtGui import QMouseEvent
-        from PySide6.QtCore import QPointF
-        widget     = self.container.pyflame_widget
-        global_pos = event.globalPosition()
-        local_pt   = widget.mapFromGlobal(global_pos.toPoint())
-        target     = widget.childAt(local_pt) or widget
-        target_pos = QPointF(target.mapFromGlobal(global_pos.toPoint()))
-        QApplication.sendEvent(
-            target,
-            QMouseEvent(event.type(), target_pos, global_pos,
-                        event.button(), event.buttons(), event.modifiers()),
-        )
-
-    # ── context menu ──────────────────────────────────────────────────────────
-
-    def _show_context_menu(self, global_pos):
-        m      = self.container.model
-        canvas = self.container.canvas
-
-        menu = QMenu(self)
-        menu.setStyleSheet(canvas._MENU_STYLE)
-
-        mw = canvas.window()
-        if hasattr(mw, 'undo_action') and hasattr(mw, 'redo_action'):
-            menu.addAction(mw.undo_action)
-            # Only show Redo in context menu when redo is actually available.
-            if mw.redo_action.isEnabled():
-                menu.addAction(mw.redo_action)
-            menu.addSeparator()
-
-        duplicate_action   = menu.addAction('Duplicate Widget')
-        delete_action      = menu.addAction('Delete Widget')
-        menu.addSeparator()
-
-        row_above_action   = menu.addAction('Add Row Above')
-        row_below_action   = menu.addAction('Add Row Below')
-        del_row_action     = menu.addAction('Delete Row')
-        del_row_action.setEnabled(canvas.config.grid_rows > 1)
-        menu.addSeparator()
-        col_left_action    = menu.addAction('Add Column Left')
-        col_right_action   = menu.addAction('Add Column Right')
-        del_col_action     = menu.addAction('Delete Column')
-        del_col_action.setEnabled(canvas.config.grid_columns > 1)
-
-        action = menu.exec(global_pos)
-        if action == row_above_action:
-            canvas._insert_row(m.row, above=True)
-        elif action == row_below_action:
-            canvas._insert_row(m.row, above=False)
-        elif action == del_row_action:
-            canvas._delete_row(m.row)
-        elif action == col_left_action:
-            canvas._insert_col(m.col, left=True)
-        elif action == col_right_action:
-            canvas._insert_col(m.col, left=False)
-        elif action == del_col_action:
-            canvas._delete_col(m.col)
-        elif action == duplicate_action:
-            canvas.select_widget(self.container)
-            canvas.duplicate_selected()
-        elif action == delete_action:
-            self._delete_widget()
-
-    def _delete_widget(self):
-        canvas = self.container.canvas
-        canvas.select_widget(self.container)
-        canvas.remove_selected()
-
-    def _open_move_resize_dialog(self):
-        dlg = MoveResizeDialog(self.container, self.container.canvas)
-        dlg.exec()
-
-    # ── resize helper ─────────────────────────────────────────────────────────
-
-    def _apply_resize(self, delta, orig):
-        canvas = self.container.canvas
-        cfg    = canvas.config
-        z      = canvas.zoom_factor
-        min_w  = max(1, int(cfg.column_width * z))
-        min_h  = max(1, int(cfg.row_height * z))
-        dx, dy = delta.x(), delta.y()
-        left, top, right, bottom = orig.left(), orig.top(), orig.right(), orig.bottom()
-
-        if 'w' in self._mode:
-            left = min(orig.left() + dx, right - min_w)
-        if 'e' in self._mode:
-            right = max(orig.right() + dx, left + min_w)
-        if 'n' in self._mode:
-            top = min(orig.top() + dy, bottom - min_h)
-        if 's' in self._mode:
-            bottom = max(orig.bottom() + dy, top + min_h)
-
-        self.container.setGeometry(left, top, right - left, bottom - top)
-
-    # ── snap to grid ──────────────────────────────────────────────────────────
-
-    def _snap_to_grid(self):
-        canvas   = self.container.canvas
-        cfg      = canvas.config
-        z        = canvas.zoom_factor
-        cw       = max(1, int(cfg.column_width * z))
-        rh       = max(1, int(cfg.row_height * z))
-        ox       = int(CHROME_SIDE_W * z)
-        oy       = int(CHROME_TITLE_H * z)
-        geom     = self.container.geometry()
-
-        prev_row = self.container.model.row
-        prev_col = self.container.model.col
-        prev_row_span = self.container.model.row_span
-        prev_col_span = self.container.model.col_span
-
-        col      = round((geom.x() - ox) / cw)
-        row      = round((geom.y() - oy) / rh)
-        col_span = max(1, round(geom.width()  / cw))
-        row_span = max(1, round(geom.height() / rh))
-
-        col      = max(0, min(col,      cfg.grid_columns - 1))
-        row      = max(0, min(row,      cfg.grid_rows    - 1))
-        col_span = min(col_span, cfg.grid_columns - col)
-        row_span = min(row_span, cfg.grid_rows    - row)
-
-        # Lock span on fixed axes
-        fixed = WIDGET_SPECS.get(self.container.model.widget_type, {}).get('fixed_axes', set())
-        if 'h' in fixed:
-            row_span = 1
-        if 'w' in fixed:
-            col_span = 1
-
-        # Prevent overlap; if blocked, revert to previous grid placement.
-        if canvas._has_overlap(row, col, row_span, col_span, ignore_container=self.container):
-            row, col, row_span, col_span = prev_row, prev_col, prev_row_span, prev_col_span
-
-        model = self.container.model
-        model.row, model.col           = row, col
-        model.row_span, model.col_span = row_span, col_span
-
-        # Use canonical cell_rect so geometry is always consistent with
-        # current grid gap/zoom rules.
-        self.container.setGeometry(
-            canvas.cell_rect(row, col, row_span, col_span)
-        )
-
-
-# ==============================================================================
-# WidgetContainer
-# ==============================================================================
-
-class WidgetContainer(QFrame):
-    """Wraps one real PyFlame widget on the canvas with a transparent overlay."""
-
-    def __init__(self, pyflame_widget, placed_model, canvas):
-        super().__init__(canvas)
-        self.model = placed_model
-        self.canvas = canvas
-        self.selected = False
-        self.pyflame_widget = pyflame_widget
-
-        self.setFrameStyle(QFrame.NoFrame)
-        self.setAttribute(Qt.WA_NoSystemBackground, True)
-        self.setStyleSheet('background: transparent; border: none;')
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self._layout.setSpacing(0)
-        self._layout.addWidget(pyflame_widget)
-        self._free_size_constraints(pyflame_widget)
-
-        self.overlay = WidgetOverlay(self)
-        self.overlay.move(0, 0)
-        self.overlay.raise_()   # must be above pyflame_widget in Z-order
-
-        # Belt-and-suspenders: if pyflame widget or any descendant ends up
-        # above the overlay (some PyFlame widgets raise themselves), the event
-        # filter on the overlay will still catch the click.
-        self._install_filter(pyflame_widget)
-
-    def _install_filter(self, widget):
-        widget.installEventFilter(self.overlay)
-        from PySide6.QtWidgets import QWidget as _QW
-        for child in widget.findChildren(_QW):
-            child.installEventFilter(self.overlay)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.overlay.resize(self.size())
-        self.overlay.raise_()   # re-raise after Qt re-stacks layout children
-        self.overlay.update()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self.overlay.raise_()
-
-    def set_selected(self, selected):
-        self.selected = selected
-        self.overlay.update()
-
-    @staticmethod
-    def _free_size_constraints(widget):
-        """Remove fixed-size locks set by PyFlame widgets so the layout can
-        expand them to fill the container."""
-        widget.setMinimumSize(0, 0)
-        widget.setMaximumSize(16777215, 16777215)   # QWIDGETSIZE_MAX
-        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-    def replace_inner_widget(self, new_widget):
-        """Swap the inner PyFlame widget (called on property change)."""
-        item = self._layout.takeAt(0)
-        if item and item.widget():
-            item.widget().deleteLater()
-        self.pyflame_widget = new_widget
-        self._layout.addWidget(new_widget)
-        self._free_size_constraints(new_widget)
-        # Reinstall event filter on the new widget and keep overlay on top
-        self._install_filter(new_widget)
-        self.overlay.raise_()
-
-    # ── static factory ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def make_widget(widget_type, props):
-        """Instantiate the real PyFlame widget from type name + props dict."""
-        if not _pyflame_loaded:
-            return _make_fallback_widget(widget_type)
-        cls = globals().get(widget_type)
-        if cls is None:
-            return _make_fallback_widget(widget_type)
-        kwargs = _props_to_kwargs(widget_type, props)
-        try:
-            w = cls(**kwargs)
-            if widget_type == 'PyFlameHorizontalLine':
-                host = QWidget()
-                host.setStyleSheet('background: transparent;')
-                lay = QVBoxLayout(host)
-                lay.setContentsMargins(0, 0, 0, 0)
-                lay.addStretch(1)
-                line = QFrame()
-                line.setFixedHeight(1)
-                line.setStyleSheet('background: #4a4a4a; border: none;')
-                lay.addWidget(line)
-                lay.addStretch(1)
-                return host
-            if widget_type == 'PyFlameVerticalLine':
-                host = QWidget()
-                host.setStyleSheet('background: transparent;')
-                lay = QHBoxLayout(host)
-                lay.setContentsMargins(0, 0, 0, 0)
-                lay.addStretch(1)
-                line = QFrame()
-                line.setFixedWidth(1)
-                line.setStyleSheet('background: #4a4a4a; border: none;')
-                lay.addWidget(line)
-                lay.addStretch(1)
-                return host
-            if widget_type == 'PyFlameProgressBarWidget':
-                host = ProgressBarPreview()
-                host.setStyleSheet('background: transparent;')
-                return host
-            return w
-        except Exception as e:
-            print(f'Warning: {widget_type}({kwargs}) → {e}')
-            return _make_fallback_widget(widget_type)
-
-
-# ==============================================================================
-# CanvasWidget
-# ==============================================================================
-
-class CanvasWidget(QWidget):
-    """The design surface. Children (WidgetContainers) are placed absolutely."""
-
-    widget_moved    = Signal(object)   # emits WidgetContainer
-    widget_selected = Signal(object)   # emits WidgetContainer or None
-    grid_changed    = Signal(object)   # emits updated WindowConfig
-    content_changed = Signal()         # add/remove widgets
-
-    def __init__(self, config: WindowConfig):
-        super().__init__()
-        self.config = config
-        self.zoom_factor = 1.0
-        self.grid_visible = False
-        self.containers: list[WidgetContainer] = []
-        self.selected_container = None
-        self.setAcceptDrops(True)
-        self.setFocusPolicy(Qt.StrongFocus)
-        sz = self.canvas_size()
-        self.setMinimumSize(sz)
-        self.resize(sz)
-
-        # Zoom controls live in the main UI bottom bar (not inside canvas)
-
-    # ── sizing ────────────────────────────────────────────────────────────────
-
-    def canvas_size(self):
-        base_w = CHROME_SIDE_W + self.config.grid_columns * self.config.column_width
-        base_h = CHROME_TITLE_H + self.config.grid_rows * self.config.row_height + CHROME_MSG_H
-        return QSize(int(base_w * self.zoom_factor), int(base_h * self.zoom_factor))
-
-    def sizeHint(self):
-        return self.canvas_size()
-
-    def grid_origin(self):
-        return QPoint(int(CHROME_SIDE_W * self.zoom_factor), int(CHROME_TITLE_H * self.zoom_factor))
-
-    def cell_rect(self, row, col, rowspan=1, colspan=1):
-        ox = int(CHROME_SIDE_W * self.zoom_factor)
-        oy = int(CHROME_TITLE_H * self.zoom_factor)
-        cw = int(self.config.column_width * self.zoom_factor)
-        rh = int(self.config.row_height * self.zoom_factor)
-        gap = max(1, int(CELL_GAP * self.zoom_factor))
-        x = ox + col * cw + gap // 2
-        y = oy + row * rh + gap // 2
-        # Span from interior edge to interior edge across selected cells.
-        # (Subtract one total gap, not one per cell, to avoid coming up short.)
-        w = max(1, colspan * cw - gap)
-        h = max(1, rowspan * rh - gap)
-        return QRect(x, y, w, h)
-
-    def _pos_to_cell(self, pos):
-        ox = int(CHROME_SIDE_W * self.zoom_factor)
-        oy = int(CHROME_TITLE_H * self.zoom_factor)
-        cw = max(1, int(self.config.column_width * self.zoom_factor))
-        rh = max(1, int(self.config.row_height * self.zoom_factor))
-        col = max(0, min((pos.x() - ox) // cw, self.config.grid_columns - 1))
-        row = max(0, min((pos.y() - oy) // rh, self.config.grid_rows - 1))
-        return int(row), int(col)
-
-    @staticmethod
-    def _cells_overlap(r1, c1, rs1, cs1, r2, c2, rs2, cs2) -> bool:
-        return not (
-            r1 + rs1 <= r2 or r2 + rs2 <= r1 or
-            c1 + cs1 <= c2 or c2 + cs2 <= c1
-        )
-
-    def _has_overlap(self, row, col, row_span, col_span, ignore_container=None) -> bool:
-        for c in self.containers:
-            if c is ignore_container:
-                continue
-            m = c.model
-            if self._cells_overlap(row, col, row_span, col_span, m.row, m.col, m.row_span, m.col_span):
-                return True
-        return False
-
-    # ── painting ──────────────────────────────────────────────────────────────
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        cs = self.canvas_size()
-
-        # Background
-        p.fillRect(self.rect(), QColor('#232323'))
-
-        side_w = int(CHROME_SIDE_W * self.zoom_factor)
-        title_h = int(CHROME_TITLE_H * self.zoom_factor)
-        msg_h = int(CHROME_MSG_H * self.zoom_factor)
-
-        # Blue left strip (Flame chrome)
-        p.fillRect(0, 0, side_w, cs.height(), QColor(0, 110, 175))
-
-        # Title bar
-        title_rect = QRect(side_w, 0, cs.width() - side_w, title_h)
-        p.fillRect(title_rect, QColor('#222222'))
-        p.setPen(QColor('#b0b0b0'))
-        title_font = QFont('Montserrat', 22, QFont.Light)
-        p.setFont(title_font)
-
-        name_text = self.config.script_name
-        version_text = (self.config.script_version or '').strip()
-        if version_text and not version_text.lower().startswith('v'):
-            version_text = f'v{version_text}'
-
-        text_rect = title_rect.adjusted(16, 0, -8, 0)
-        p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, name_text)
-
-        # Draw version at half title size right after script name.
-        if version_text:
-            name_width = p.fontMetrics().horizontalAdvance(name_text)
-            version_font = QFont('Montserrat', 16, QFont.Light)
-            p.setFont(version_font)
-            version_x = text_rect.x() + name_width + 10
-            # Push version text slightly down so baseline aligns visually with title text.
-            version_rect = QRect(version_x, text_rect.y() + 2, text_rect.width(), text_rect.height())
-            p.drawText(version_rect,
-                       Qt.AlignVCenter | Qt.AlignLeft,
-                       version_text)
-
-        # Message bar (same family as title bar)
-        msg_y = title_h + int(self.config.grid_rows * self.config.row_height * self.zoom_factor)
-        p.fillRect(QRect(side_w, msg_y, cs.width() - side_w, msg_h),
-                   QColor('#222222'))
-
-        # Main content area (between title and message bars) slightly brighter.
-        content_h = msg_y - title_h
-        if content_h > 0:
-            p.fillRect(QRect(side_w, title_h, cs.width() - side_w, content_h), QColor('#2b2b2b'))
-
-        # Grid cells (visibility toggle affects drawing only; snapping still active)
-        if self.grid_visible:
-            for row in range(self.config.grid_rows):
-                for col in range(self.config.grid_columns):
-                    r = self.cell_rect(row, col)
-                    p.fillRect(r, QColor('#2d2d2d'))
-                    p.setPen(QPen(QColor('#3a3a3a'), 1))
-                    p.drawRect(r.adjusted(0, 0, -1, -1))
-
-        p.end()
-
-    # ── drag-and-drop ─────────────────────────────────────────────────────────
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasFormat('application/x-pyflame-widget'):
-            event.acceptProposedAction()
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasFormat('application/x-pyflame-widget'):
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        widget_type = (event.mimeData()
-                       .data('application/x-pyflame-widget')
-                       .data().decode())
-        row, col = self._pos_to_cell(event.position().toPoint())
-        self._add_widget(widget_type, row, col)
-        event.acceptProposedAction()
-
-    # ── selection ─────────────────────────────────────────────────────────────
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.RightButton:
-            row, col = self._pos_to_cell(event.position().toPoint())
-            self._show_grid_menu(event.globalPosition().toPoint(), row, col)
-        else:
-            self.select_widget(None)
-
-    def select_widget(self, container):
-        if self.selected_container is container:
-            return
-        if self.selected_container is not None:
-            self.selected_container.set_selected(False)
-        self.selected_container = container
-        if container is not None:
-            container.set_selected(True)
-        self.setFocus()
-        self.widget_selected.emit(container)
-
-    # ── add / remove ──────────────────────────────────────────────────────────
-
-    def _add_widget(self, widget_type, row, col):
-        specs = WIDGET_SPECS.get(widget_type)
-        if not specs:
-            return
-        if self._has_overlap(row, col, 1, 1):
-            return
-        default_props = {p.name: p.default for p in specs['props']}
-        model = PlacedWidget(
-            widget_type=widget_type,
-            row=row, col=col,
-            properties=default_props,
-        )
-        model.var_name = self._auto_var_name(widget_type)
-        try:
-            widget = WidgetContainer.make_widget(widget_type, default_props)
-        except Exception as e:
-            print(f'Error creating widget: {e}')
-            return
-        container = WidgetContainer(widget, model, self)
-        container.setGeometry(self.cell_rect(row, col))
-        container.show()
-        self.containers.append(container)
-        self.select_widget(container)
-        self.content_changed.emit()
-
-    def _auto_var_name(self, widget_type):
-        raw = widget_type.replace('PyFlame', '')
-        # Convert CamelCase widget names to snake_case var names.
-        short = re.sub(r'(?<!^)(?=[A-Z])', '_', raw).lower()
-        count = sum(1 for c in self.containers if c.model.widget_type == widget_type) + 1
-        return f'{short}_{count}'
-
-    def remove_selected(self):
-        if not self.selected_container:
-            return
-        c = self.selected_container
-        self.selected_container = None
-        self.containers.remove(c)
-        c.deleteLater()
-        self.widget_selected.emit(None)
-        self.content_changed.emit()
-
-    def duplicate_selected(self):
-        if not self.selected_container:
-            return
-        src = self.selected_container
-        sm = src.model
-
-        # Try nearby offsets first, then scan full grid.
-        candidate_positions = [
-            (sm.row, sm.col + 1),
-            (sm.row + 1, sm.col),
-            (sm.row + 1, sm.col + 1),
-            (sm.row, sm.col - 1),
-            (sm.row - 1, sm.col),
-        ]
-        for r in range(self.config.grid_rows):
-            for c in range(self.config.grid_columns):
-                candidate_positions.append((r, c))
-
-        target = None
-        for row, col in candidate_positions:
-            if row < 0 or col < 0:
-                continue
-            if row + sm.row_span > self.config.grid_rows:
-                continue
-            if col + sm.col_span > self.config.grid_columns:
-                continue
-            if self._has_overlap(row, col, sm.row_span, sm.col_span):
-                continue
-            target = (row, col)
-            break
-
-        if target is None:
-            return
-
-        new_props = copy.deepcopy(sm.properties)
-        model = PlacedWidget(
-            widget_type=sm.widget_type,
-            row=target[0],
-            col=target[1],
-            row_span=sm.row_span,
-            col_span=sm.col_span,
-            properties=new_props,
-        )
-        model.var_name = self._auto_var_name(sm.widget_type)
-
-        try:
-            widget = WidgetContainer.make_widget(sm.widget_type, new_props)
-        except Exception as e:
-            print(f'Error duplicating widget: {e}')
-            return
-
-        container = WidgetContainer(widget, model, self)
-        container.setGeometry(self.cell_rect(model.row, model.col, model.row_span, model.col_span))
-        container.show()
-        self.containers.append(container)
-        self.select_widget(container)
-        self.content_changed.emit()
-
-    def nudge_selected(self, d_row: int, d_col: int):
-        if not self.selected_container:
-            return
-        c = self.selected_container
-        m = c.model
-        new_row = m.row + d_row
-        new_col = m.col + d_col
-
-        if new_row < 0 or new_col < 0:
-            return
-        if new_row + m.row_span > self.config.grid_rows:
-            return
-        if new_col + m.col_span > self.config.grid_columns:
-            return
-        if self._has_overlap(new_row, new_col, m.row_span, m.col_span, ignore_container=c):
-            return
-
-        m.row = new_row
-        m.col = new_col
-        c.setGeometry(self.cell_rect(m.row, m.col, m.row_span, m.col_span))
-        self.widget_moved.emit(c)
-
-    # ── grid insert ───────────────────────────────────────────────────────────
-
-    _MENU_STYLE = (
-        'QMenu { background: #2d2d2d; color: #c8c8c8;'
-        '        border: 1px solid #555; padding: 2px; }'
-        'QMenu::item { padding: 4px 20px 4px 12px; }'
-        'QMenu::item:selected { background: #0078d7; color: white; }'
-        'QMenu::item:disabled { color: #555; }'
-        'QMenu::separator { height: 1px; background: #444; margin: 3px 6px; }'
-    )
-
-    def _show_grid_menu(self, global_pos, row, col):
-        menu = QMenu(self)
-        menu.setStyleSheet(self._MENU_STYLE)
-
-        mw = self.window()
-        if hasattr(mw, 'action_undo') and hasattr(mw, 'action_redo'):
-            menu.addAction('Undo', mw.action_undo)
-            menu.addAction('Redo', mw.action_redo)
-            menu.addSeparator()
-
-        menu.addAction('Add Row Above',   lambda: self._insert_row(row, above=True))
-        menu.addAction('Add Row Below',   lambda: self._insert_row(row, above=False))
-        del_row = menu.addAction('Delete Row',  lambda: self._delete_row(row))
-        del_row.setEnabled(self.config.grid_rows > 1)
-        menu.addSeparator()
-        menu.addAction('Add Column Left',  lambda: self._insert_col(col, left=True))
-        menu.addAction('Add Column Right', lambda: self._insert_col(col, left=False))
-        del_col = menu.addAction('Delete Column', lambda: self._delete_col(col))
-        del_col.setEnabled(self.config.grid_columns > 1)
-        menu.exec(global_pos)
-
-    def _insert_row(self, at_row, above):
-        insert_at = at_row if above else at_row + 1
-        for c in self.containers:
-            if c.model.row >= insert_at:
-                c.model.row += 1
-        self.config.grid_rows += 1
-        self.update_config(self.config)
-        self.grid_changed.emit(self.config)
-
-    def _insert_col(self, at_col, left):
-        insert_at = at_col if left else at_col + 1
-        for c in self.containers:
-            if c.model.col >= insert_at:
-                c.model.col += 1
-        self.config.grid_columns += 1
-        self.update_config(self.config)
-        self.grid_changed.emit(self.config)
-
-    def _delete_row(self, del_row):
-        if self.config.grid_rows <= 1:
-            return
-        # Remove widgets occupying this row, shift others down
-        for c in list(self.containers):
-            if c.model.row == del_row:
-                if c is self.selected_container:
-                    self.selected_container = None
-                self.containers.remove(c)
-                c.deleteLater()
-            elif c.model.row > del_row:
-                c.model.row -= 1
-        self.config.grid_rows -= 1
-        self.update_config(self.config)
-        self.widget_selected.emit(None)
-        self.grid_changed.emit(self.config)
-
-    def _delete_col(self, del_col):
-        if self.config.grid_columns <= 1:
-            return
-        # Remove widgets occupying this column, shift others left
-        for c in list(self.containers):
-            if c.model.col == del_col:
-                if c is self.selected_container:
-                    self.selected_container = None
-                self.containers.remove(c)
-                c.deleteLater()
-            elif c.model.col > del_col:
-                c.model.col -= 1
-        self.config.grid_columns -= 1
-        self.update_config(self.config)
-        self.widget_selected.emit(None)
-        self.grid_changed.emit(self.config)
-
-    # ── config update ─────────────────────────────────────────────────────────
-
-    def update_config(self, config: WindowConfig):
-        self.config = config
-        sz = self.canvas_size()
-        self.setMinimumSize(sz)
-        self.resize(sz)
-        self.update()
-        for c in self.containers:
-            m = c.model
-            # Clamp to new grid size
-            m.col = min(m.col, config.grid_columns - 1)
-            m.row = min(m.row, config.grid_rows - 1)
-            m.col_span = min(m.col_span, config.grid_columns - m.col)
-            m.row_span = min(m.row_span, config.grid_rows - m.row)
-            fixed = WIDGET_SPECS.get(m.widget_type, {}).get('fixed_axes', set())
-            if {'h', 'w'} <= set(fixed):
-                m.row_span = 1
-                m.col_span = 1
-            c.setGeometry(self.cell_rect(m.row, m.col, m.row_span, m.col_span))
-        # zoom controls are handled by the main window UI
-
-    def set_zoom(self, zoom: float):
-        self.zoom_factor = max(0.5, min(2.0, float(zoom)))
-        self.update_config(self.config)
-
-    def zoom_in(self):
-        self.set_zoom(self.zoom_factor + 0.1)
-
-    def zoom_out(self):
-        self.set_zoom(self.zoom_factor - 0.1)
-
-    def zoom_reset(self):
-        self.set_zoom(1.0)
-
-    # ── keyboard ──────────────────────────────────────────────────────────────
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Delete:
-            self.remove_selected()
-        elif event.key() == Qt.Key_Escape:
-            self.select_widget(None)
-        elif event.key() == Qt.Key_Left:
-            self.nudge_selected(0, -1)
-        elif event.key() == Qt.Key_Right:
-            self.nudge_selected(0, 1)
-        elif event.key() == Qt.Key_Up:
-            self.nudge_selected(-1, 0)
-        elif event.key() == Qt.Key_Down:
-            self.nudge_selected(1, 0)
-        else:
-            super().keyPressEvent(event)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-
-
-# ==============================================================================
-# PannableScrollArea
-# ==============================================================================
-
-class PannableScrollArea(QScrollArea):
-    """Scroll area with middle-mouse drag panning."""
-
-    def __init__(self):
-        super().__init__()
-        self._panning = False
-        self._pan_start = None
-        self._h_start = 0
-        self._v_start = 0
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MiddleButton:
-            self._panning = True
-            self._pan_start = event.position().toPoint()
-            self._h_start = self.horizontalScrollBar().value()
-            self._v_start = self.verticalScrollBar().value()
-            self.viewport().setCursor(Qt.ClosedHandCursor)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._panning and self._pan_start is not None:
-            delta = event.position().toPoint() - self._pan_start
-            self.horizontalScrollBar().setValue(self._h_start - delta.x())
-            self.verticalScrollBar().setValue(self._v_start - delta.y())
-            event.accept()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MiddleButton and self._panning:
-            self._panning = False
-            self._pan_start = None
-            self.viewport().unsetCursor()
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
-
-
-# ==============================================================================
-# Preview helper widgets
-# ==============================================================================
-
-class ProgressBarPreview(QWidget):
-    """Simple preview: centered blue bar with equal outer padding."""
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, False)
-
-        w = self.width()
-        h = self.height()
-        pad = 5
-        inner_w = max(1, w - (pad * 2))
-        inner_h_space = max(1, h - (pad * 2))
-        # Make the bar slightly thinner (2px less on top and bottom visual footprint).
-        bar_h = max(1, (inner_h_space // 2) - 4)
-        bar_y = (h - bar_h) // 2
-
-        p.fillRect(QRect(pad, bar_y, inner_w, bar_h), QColor('#2f7fbf'))
-        p.end()
-
-
-# ==============================================================================
-# WidgetPalette
-# ==============================================================================
-
-class WidgetPalette(QListWidget):
-    """Draggable list of available widget types in one alphabetical list."""
-
-    def __init__(self):
-        super().__init__()
-        self.setDragEnabled(True)
-        self.setDefaultDropAction(Qt.CopyAction)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
-
-        items = sorted(
-            ((wtype, spec['display']) for wtype, spec in WIDGET_SPECS.items()),
-            key=lambda x: x[1].lower(),
-        )
-
-        for wtype, display in items:
-            item = QListWidgetItem(display)
-            item.setData(Qt.UserRole, wtype)
-            item.setForeground(QColor('#c8c8c8'))
-            self.addItem(item)
-
-    def startDrag(self, actions):
-        item = self.currentItem()
-        if item is None or not item.data(Qt.UserRole):
-            return
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setData('application/x-pyflame-widget',
-                     item.data(Qt.UserRole).encode())
-        drag.setMimeData(mime)
-        drag.exec(Qt.CopyAction)
-
-
-# ==============================================================================
-# PropertiesPanel
-# ==============================================================================
-
-class PropertiesPanel(QWidget):
-    """Dynamically-built form showing properties of the selected widget."""
-
-    properties_changed = Signal()
-
-    def __init__(self):
-        super().__init__()
-        self.container: WidgetContainer | None = None
-        self._building = False
-
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-
-        self.title_label = QLabel('Widget Properties')
-        self.title_label.setStyleSheet(
-            'color: #888; font-size: 11px; padding: 4px 4px 2px;'
-        )
-        layout.addWidget(self.title_label)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameStyle(QFrame.NoFrame)
-        layout.addWidget(self.scroll)
-
-        self.inner = QWidget()
-        self.inner_layout = QVBoxLayout(self.inner)
-        self.inner_layout.setContentsMargins(4, 4, 4, 4)
-        self.inner_layout.setSpacing(6)
-        self.inner_layout.addStretch()
-        self.scroll.setWidget(self.inner)
-
-    # ── public API ────────────────────────────────────────────────────────────
-
-    def show_properties(self, container: WidgetContainer):
-        self.container = container
-        self._rebuild()
-
-    def clear(self):
-        self.container = None
-        self._rebuild()
-
-    # ── rebuild form ──────────────────────────────────────────────────────────
-
-    def _rebuild(self):
-        self._building = True
-        while self.inner_layout.count():
-            item = self.inner_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        if self.container is None:
-            self.title_label.setText('Widget Properties')
-            self.inner_layout.addStretch()
-            self._building = False
-            return
-
-        model = self.container.model
-        specs = WIDGET_SPECS.get(model.widget_type, {})
-        self.title_label.setText(f'{specs.get("display", model.widget_type)} Properties')
-
-        # Var name
-        self._add_group('Variable', [('var_name', 'str', model.var_name, [])])
-
-        # Widget properties
-        if specs.get('props'):
-            rows = [(p.name, p.kind, model.properties.get(p.name, p.default), p.options)
-                    for p in specs['props']]
-            self._add_group('Properties', rows, is_props=True)
-
-        # Grid position
-        grid_rows = [
-            ('row',      'int', model.row,      []),
-            ('col',      'int', model.col,      []),
-        ]
-        fixed = WIDGET_SPECS.get(model.widget_type, {}).get('fixed_axes', set())
-        if not ({'h', 'w'} <= set(fixed)):
-            grid_rows += [
-                ('rowspan',  'int', model.row_span, []),
-                ('colspan',  'int', model.col_span, []),
-            ]
-        self._add_group('Grid Position', grid_rows, is_grid=True)
-
-        self.inner_layout.addStretch()
-        self._building = False
-
-    def _add_group(self, title, rows, is_props=False, is_grid=False):
-        grp = QGroupBox(title)
-        grp.setStyleSheet(self._group_style())
-        form = QFormLayout(grp)
-        form.setContentsMargins(8, 12, 8, 8)
-        form.setSpacing(4)
-        form.setLabelAlignment(Qt.AlignRight)
-
-        for row in rows:
-            name, kind, val, opts = row
-            w = self._make_input(name, kind, val, opts, is_props=is_props, is_grid=is_grid)
-            form.addRow(f'{name}:', w)
-
-        self.inner_layout.addWidget(grp)
-
-    def _make_input(self, name, kind, val, opts, is_props=False, is_grid=False):
-        s = self._input_style()
-        if kind == 'str':
-            w = QLineEdit(str(val) if val is not None else '')
-            w.setStyleSheet(s)
-            if name == 'var_name':
-                w.textChanged.connect(lambda t: self._on_var_changed(t))
-            else:
-                w.textChanged.connect(lambda t, n=name: self._on_prop(n, t))
-            return w
-
-        elif kind == 'enum':
-            w = QComboBox()
-            w.setStyleSheet(s)
-            w.addItems(opts)
-            if str(val) in opts:
-                w.setCurrentText(str(val))
-            w.currentTextChanged.connect(lambda t, n=name: self._on_prop(n, t))
-            return w
-
-        elif kind == 'bool':
-            w = QCheckBox()
-            w.setChecked(bool(val))
-            w.stateChanged.connect(lambda st, n=name: self._on_prop(n, bool(st)))
-            return w
-
-        elif kind == 'int':
-            w = QSpinBox()
-            w.setStyleSheet(s)
-            w.setRange(-999999, 999999)
-            try:
-                w.setValue(int(val))
-            except (TypeError, ValueError):
-                w.setValue(0)
-            if is_grid:
-                w.valueChanged.connect(lambda v, n=name: self._on_grid(n, v))
-            else:
-                w.valueChanged.connect(lambda v, n=name: self._on_prop(n, v))
-            return w
-
-        elif kind == 'connect':
-            callbacks  = ['(none)'] + _parse_template_callbacks()
-            w = QComboBox()
-            w.setStyleSheet(s)
-            w.addItems(callbacks)
-            current = val if val else '(none)'
-            if current in callbacks:
-                w.setCurrentText(current)
-            w.currentTextChanged.connect(
-                lambda t, n=name: self._on_prop(n, None if t == '(none)' else t)
-            )
-            return w
-
-        elif kind == 'token_dest':
-            w = QComboBox()
-            w.setStyleSheet(s)
-            entry_vars = []
-            if self.container and self.container.canvas:
-                for c in self.container.canvas.containers:
-                    wt = c.model.widget_type
-                    if wt in ('PyFlameEntry', 'PyFlameEntryBrowser'):
-                        vn = (c.model.var_name or '').strip()
-                        if vn:
-                            entry_vars.append(vn)
-            options = ['None'] + sorted(set(entry_vars)) if entry_vars else ['None']
-            w.addItems(options)
-            current = val if val else 'None'
-            if current in options:
-                w.setCurrentText(current)
-            w.currentTextChanged.connect(
-                lambda t, n=name: self._on_prop(n, None if t == 'None' else t)
-            )
-            return w
-
-        elif kind == 'list':
-            w = QPlainTextEdit()
-            w.setStyleSheet(s)
-            w.setMaximumHeight(72)
-            if isinstance(val, list):
-                w.setPlainText('\n'.join(str(x) for x in val))
-            else:
-                w.setPlainText(str(val) if val else '')
-            w.textChanged.connect(
-                lambda n=name, widget=w:
-                    self._on_prop(n, [x.strip()
-                                      for x in widget.toPlainText().splitlines()
-                                      if x.strip()])
-            )
-            return w
-
-        else:
-            w = QLineEdit(str(val) if val else '')
-            w.setStyleSheet(s)
-            w.textChanged.connect(lambda t, n=name: self._on_prop(n, t))
-            return w
-
-    # ── change handlers ───────────────────────────────────────────────────────
-
-    def _on_prop(self, name, value):
-        if self._building or not self.container:
-            return
-        model = self.container.model
-        model.properties[name] = value
-
-        # Keep slider values valid while editing so widget doesn't fallback.
-        if model.widget_type == 'PyFlameSlider':
-            props = model.properties
-            try:
-                min_v = int(props.get('min_value', 0))
-            except (TypeError, ValueError):
-                min_v = 0
-            try:
-                max_v = int(props.get('max_value', 100))
-            except (TypeError, ValueError):
-                max_v = 100
-            try:
-                start_v = int(props.get('start_value', 0))
-            except (TypeError, ValueError):
-                start_v = 0
-
-            if max_v <= min_v:
-                max_v = min_v + 1
-            if start_v < min_v:
-                start_v = min_v
-            if start_v > max_v:
-                start_v = max_v
-
-            props['min_value'] = min_v
-            props['max_value'] = max_v
-            props['start_value'] = start_v
-
-        self._recreate_widget()
-        self.properties_changed.emit()
-
-    def _on_grid(self, attr, value):
-        if self._building or not self.container:
-            return
-        m = self.container.model
-        canvas = self.container.canvas
-        cfg = canvas.config
-
-        prev = (m.row, m.col, m.row_span, m.col_span)
-
-        if attr == 'row':
-            m.row = value
-        elif attr == 'col':
-            m.col = value
-        elif attr == 'rowspan':
-            m.row_span = value
-        elif attr == 'colspan':
-            m.col_span = value
-
-        # Keep widget fully inside the grid bounds.
-        m.row_span = max(1, min(m.row_span, cfg.grid_rows))
-        m.col_span = max(1, min(m.col_span, cfg.grid_columns))
-        m.row = max(0, min(m.row, cfg.grid_rows - m.row_span))
-        m.col = max(0, min(m.col, cfg.grid_columns - m.col_span))
-
-        # Prevent overlap with other widgets.
-        if canvas._has_overlap(m.row, m.col, m.row_span, m.col_span, ignore_container=self.container):
-            m.row, m.col, m.row_span, m.col_span = prev
-
-        r = self.container.canvas.cell_rect(m.row, m.col, m.row_span, m.col_span)
-        self.container.setGeometry(r)
-
-        # Refresh form values in case we clamped/reverted anything.
-        self.show_properties(self.container)
-        self.properties_changed.emit()
-
-    def _on_var_changed(self, text):
-        if self._building or not self.container:
-            return
-        self.container.model.var_name = text
-        self.properties_changed.emit()
-
-    def _recreate_widget(self):
-        if not self.container:
-            return
-        m = self.container.model
-        try:
-            new_w = WidgetContainer.make_widget(m.widget_type, m.properties)
-            self.container.replace_inner_widget(new_w)
-        except Exception as e:
-            print(f'Error recreating widget: {e}')
-
-    # ── styles ────────────────────────────────────────────────────────────────
-
-    def _group_style(self):
-        return (
-            'QGroupBox { color: #888; border: 1px solid #3a3a3a; border-radius: 3px;'
-            ' margin-top: 8px; font-size: 10px; }'
-            'QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 3px; }'
-        )
-
-    def _input_style(self):
-        return (
-            'background: #2d2d2d; border: 1px solid #3a3a3a;'
-            ' color: #c8c8c8; padding: 2px;'
-        )
-
-
-# ==============================================================================
-# WindowConfigBar
-# ==============================================================================
-
-class WindowConfigBar(QWidget):
-    """Two-row config bar: script metadata on row 1, window options on row 2."""
-
-    config_changed = Signal(object)   # emits WindowConfig
-    LICENSE_TYPES  = list(LICENSE_DATA.keys())
-
-    def __init__(self, config: WindowConfig):
-        super().__init__()
-        self.config    = config
-        self._updating = False
-
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        vbox = QVBoxLayout(self)
-        vbox.setContentsMargins(8, 3, 8, 3)
-        vbox.setSpacing(2)
-
-        es = ('background: #2d2d2d; border: 1px solid #3a3a3a;'
-              ' color: #c8c8c8; padding: 1px 4px;')
-        ls = 'color: #888; font-size: 10px;'
-
-        def lbl(t):
-            w = QLabel(t)
-            w.setStyleSheet(ls)
-            return w
-
-        # ── Row 1: Script metadata ────────────────────────────────────────────
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
-
-        row1.addWidget(lbl('Script Name:'))
-        self.script_name = QLineEdit(config.script_name)
-        self.script_name.setStyleSheet(es)
-        self.script_name.setFixedWidth(140)
-        self.script_name.setFixedHeight(22)
-        self.script_name.textChanged.connect(self._on_change)
-        row1.addWidget(self.script_name)
-
-        row1.addWidget(lbl('Written By:'))
-        self.written_by = QLineEdit(config.written_by)
-        self.written_by.setStyleSheet(es)
-        self.written_by.setFixedWidth(140)
-        self.written_by.setFixedHeight(22)
-        self.written_by.textChanged.connect(self._on_change)
-        row1.addWidget(self.written_by)
-
-        row1.addWidget(lbl('Script Version:'))
-        self.version = QLineEdit(config.script_version)
-        self.version.setStyleSheet(es)
-        self.version.setMaximumWidth(80)
-        self.version.setFixedHeight(22)
-        self.version.textChanged.connect(self._on_change)
-        row1.addWidget(self.version)
-
-        row1.addWidget(lbl('Flame Version:'))
-        self.flame_version = QLineEdit(config.flame_version)
-        self.flame_version.setStyleSheet(es)
-        self.flame_version.setFixedWidth(95)
-        self.flame_version.setFixedHeight(22)
-        self.flame_version.setToolTip('Use digits and dots only (e.g. 2025.1, 2025.3.2, 2026, 2026.1). Minimum supported is 2025.1')
-        self._flame_validator = QRegularExpressionValidator(QRegularExpression(r'^\d+(?:\.\d+){0,2}$'))
-        self.flame_version.setValidator(self._flame_validator)
-        self.flame_version.textChanged.connect(self._on_change)
-        row1.addWidget(self.flame_version)
-
-        row1.addWidget(lbl('Hooks:'))
-
-        self._hook_button = QPushButton()
-        self._hook_button.setStyleSheet(
-            es + ' text-align: left; padding: 1px 8px; min-width: 160px;'
-        )
-        self._hook_button.setFixedHeight(22)
-        self._hook_button.clicked.connect(self._show_hooks_menu)
-
-        hook_menu_style = (
-            'QMenu { background: #2d2d2d; color: #c8c8c8;'
-            '        border: 1px solid #555; padding: 2px; }'
-            'QMenu::item { padding: 4px 20px 4px 8px; }'
-            'QMenu::item:selected { background: #0078d7; color: white; }'
-            'QMenu::indicator { width: 13px; height: 13px; }'
-        )
-        self._hooks_menu = QMenu(self)
-        self._hooks_menu.setStyleSheet(hook_menu_style)
-
-        self._hook_actions: dict[str, QAction] = {}
-        for hook, label in HOOK_DISPLAY.items():
-            action = QAction(label, self._hooks_menu)
-            action.setCheckable(True)
-            action.setChecked(hook in config.hook_types)
-            action.triggered.connect(self._on_hook_toggled)
-            self._hooks_menu.addAction(action)
-            self._hook_actions[hook] = action
-
-        self._update_hook_button()
-        row1.addWidget(self._hook_button)
-
-        row1.addWidget(lbl('License:'))
-        self.license_type = QComboBox()
-        self.license_type.addItems(self.LICENSE_TYPES)
-        self.license_type.setCurrentText(config.license_type)
-        self.license_type.setStyleSheet(es)
-        self.license_type.setMinimumWidth(110)
-        self.license_type.setFixedHeight(22)
-        self.license_type.currentTextChanged.connect(self._on_change)
-        row1.addWidget(self.license_type)
-
-        row1.addStretch()
-        vbox.addLayout(row1)
-        vbox.addSpacing(22)
-
-        # ── Row 2: Window / grid options ──────────────────────────────────────
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-
-        row2.addWidget(lbl('Flame Window:'))
-
-        row2.addWidget(lbl('Cols:'))
-        self.grid_cols = QSpinBox()
-        self.grid_cols.setRange(1, 20)
-        self.grid_cols.setValue(config.grid_columns)
-        self.grid_cols.setStyleSheet(es)
-        self.grid_cols.setMaximumWidth(55)
-        self.grid_cols.setFixedHeight(22)
-        self.grid_cols.valueChanged.connect(self._on_change)
-        row2.addWidget(self.grid_cols)
-
-        row2.addWidget(lbl('Rows:'))
-        self.grid_rows = QSpinBox()
-        self.grid_rows.setRange(1, 20)
-        self.grid_rows.setValue(config.grid_rows)
-        self.grid_rows.setStyleSheet(es)
-        self.grid_rows.setMaximumWidth(55)
-        self.grid_rows.setFixedHeight(22)
-        self.grid_rows.valueChanged.connect(self._on_change)
-        row2.addWidget(self.grid_rows)
-
-        row2.addStretch()
-        vbox.addLayout(row2)
-        vbox.addSpacing(22)
-
-    # ── hook dropdown ─────────────────────────────────────────────────────────
-
-    def _show_hooks_menu(self):
-        pos = self._hook_button.mapToGlobal(QPoint(0, self._hook_button.height()))
-        self._hooks_menu.exec(pos)
-
-    def _update_hook_button(self):
-        selected = [HOOK_DISPLAY[h] for h, a in self._hook_actions.items() if a.isChecked()]
-        self._hook_button.setText(', '.join(selected) if selected else 'None')
-
-    def _on_hook_toggled(self):
-        self._update_hook_button()
-        self._on_change()
-
-    # ── change / load ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _is_flame_version_supported(version_text: str) -> bool:
-        if not version_text:
-            return False
-        parts = version_text.split('.')
-        if any((not p.isdigit()) for p in parts):
-            return False
-        # compare as (major, minor, patch) with missing pieces as 0
-        nums = [int(p) for p in parts][:3]
-        while len(nums) < 3:
-            nums.append(0)
-        return tuple(nums) >= (2025, 1, 0)
-
-    def _set_flame_version_error(self, is_error: bool):
-        base = 'background: #2d2d2d; border: 1px solid #3a3a3a; color: #c8c8c8; padding: 1px 4px;'
-        err = 'background: #3a1f1f; border: 1px solid #b94a48; color: #ffd7d7; padding: 1px 4px;'
-        self.flame_version.setStyleSheet(err if is_error else base)
-        if is_error:
-            self.flame_version.setToolTip('Invalid Flame Version. Use numeric version only (e.g. 2025.1, 2025.3.2, 2026, 2026.1). Minimum supported is 2025.1.')
-        else:
-            self.flame_version.setToolTip('Use digits and dots only (e.g. 2025.1, 2025.3.2, 2026, 2026.1). Minimum supported is 2025.1')
-
-    def _on_change(self):
-        if self._updating:
-            return
-
-        flame_version_text = self.flame_version.text().strip()
-        flame_ok = self._is_flame_version_supported(flame_version_text)
-        self._set_flame_version_error(not flame_ok)
-
-        if not flame_ok:
-            return
-
-        self.config.script_name  = self.script_name.text()
-        self.config.written_by   = self.written_by.text()
-        self.config.script_version = self.version.text()
-        self.config.flame_version = flame_version_text
-        self.config.hook_types   = [h for h, a in self._hook_actions.items()
-                                     if a.isChecked()]
-        self.config.license_type = self.license_type.currentText()
-        self.config.grid_columns = self.grid_cols.value()
-        self.config.grid_rows    = self.grid_rows.value()
-        self.config_changed.emit(self.config)
-
-    def load_config(self, config: WindowConfig):
-        self._updating = True
-        self.config = config
-        self.script_name.setText(config.script_name)
-        self.written_by.setText(config.written_by)
-        self.version.setText(config.script_version)
-        self.flame_version.setText(config.flame_version)
-        self._set_flame_version_error(not self._is_flame_version_supported(config.flame_version))
-        for hook, action in self._hook_actions.items():
-            action.setChecked(hook in config.hook_types)
-        self._update_hook_button()
-        self.license_type.setCurrentText(config.license_type)
-        self.grid_cols.setValue(config.grid_columns)
-        self.grid_rows.setValue(config.grid_rows)
-        self._updating = False
-
-
-# ==============================================================================
-# CodeGenerator
-# ==============================================================================
-
-class CodeGenerator:
-
-    # Widget type → comment section label
-    _SECTION_LABELS = {
-        'PyFlameLabel':           'Labels',
-        'PyFlameEntry':           'Entries',
-        'PyFlameEntryBrowser':    'Entries',
-        'PyFlameButton':          'Buttons',
-        'PyFlamePushButton':      'Buttons',
-        'PyFlameMenu':            'Menus',
-        'PyFlameColorMenu':       'Menus',
-        'PyFlameTokenMenu':       'Menus',
-        'PyFlameSlider':          'Sliders',
-        'PyFlameListWidget':      'List Widgets',
-        'PyFlameTreeWidget':      'Tree Widgets',
-        'PyFlameTextEdit':        'Text Edits',
-        'PyFlameTextBrowser':     'Text Browsers',
-        'PyFlameProgressBarWidget': 'Progress Bars',
-        'PyFlameHorizontalLine':  'Lines',
-        'PyFlameVerticalLine':    'Lines',
-    }
-
-    @classmethod
-    def generate(cls, config: WindowConfig, widgets: list[PlacedWidget],
-                 tab_order: list[str] | None = None) -> str:
-        today     = datetime.date.today().strftime('%m.%d.%y')
-        year      = str(datetime.date.today().year)
-        snake     = _to_snake(config.script_name)
-        classname = ''.join(w.title() for w in config.script_name.split())
-        lic       = LICENSE_DATA.get(config.license_type, LICENSE_DATA['GPL-3.0'])
-
-        # Read template
-        tmpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'script_template', 'script_template.py')
-        with open(tmpl_path, 'r') as _f:
-            tmpl = _f.read()
-
-        # License header block (ends with \n\n to produce blank line before docstring)
-        if lic['header']:
-            lic_header = '\n'.join(lic['header']) + '\n\n'
-        else:
-            lic_header = '\n'
-
-        # Widget declarations block
-        widget_decl = cls._build_widget_declarations(widgets)
-
-        # Tab order block
-        if tab_order:
-            tab_lines = [
-                '        # Set Entry Tab-key Order',
-                '        self.window.tab_order = [',
-            ]
-            for var in tab_order:
-                tab_lines.append(f'            self.{var},')
-            tab_lines += ['            ]', '']
-            tab_block = '\n'.join(tab_lines) + '\n'
-        else:
-            tab_block = ''
-
-        # Widget layout block
-        layout_lines = []
-        for w in sorted(widgets, key=lambda x: (x.row, x.col)):
-            var = w.var_name or 'widget'
-            if w.row_span > 1 or w.col_span > 1:
-                layout_lines.append(
-                    f'        self.window.grid_layout.addWidget('
-                    f'self.{var}, {w.row}, {w.col}, {w.row_span}, {w.col_span})'
-                )
-            else:
-                layout_lines.append(
-                    f'        self.window.grid_layout.addWidget('
-                    f'self.{var}, {w.row}, {w.col})'
-                )
-        layout_block = '\n'.join(layout_lines) + '\n' if layout_lines else ''
-
-        # set_focus for first non-read-only entry widget
-        entry_widgets = [
-            w for w in widgets
-            if w.widget_type in ('PyFlameEntry', 'PyFlameEntryBrowser')
-        ]
-        set_focus = ''
-        first_focusable = None
-        for w in entry_widgets:
-            read_only = bool((w.properties or {}).get('read_only', False))
-            if not read_only:
-                first_focusable = w
-                break
-        if first_focusable:
-            first_var = first_focusable.var_name or 'entry'
-            set_focus = f'        self.{first_var}.set_focus()\n'
-
-        # Flame menu hook functions
-        flame_menus = '\n'.join(cls._menu_hook(config, classname))
-
-        # Apply all substitutions
-        subs = {
-            '<<<SCRIPT_NAME>>>':       config.script_name,
-            '<<<WRITTEN_BY>>>':        config.written_by,
-            '<<<YEAR>>>':              year,
-            '<<<LICENSE_HEADER>>>':    lic_header,
-            '<<<SCRIPT_VERSION>>>':    config.script_version,
-            '<<<FLAME_VERSION>>>':     config.flame_version,
-            '<<<DATE>>>':              today,
-            '<<<LICENSE_DOCSTRING>>>': lic['docstring'],
-            '<<<SCRIPT_TYPE>>>':       cls._script_type_label(config.hook_types),
-            '<<<MENU_PATH>>>':         cls._menu_path(config),
-            '<<<SNAKE_NAME>>>':        snake,
-            '<<<CLASS_NAME>>>':        classname,
-            '<<<GRID_COLUMNS>>>':      str(config.grid_columns),
-            '<<<GRID_ROWS>>>':         str(config.grid_rows),
-            '<<<WIDGET_DECLARATIONS>>>': widget_decl,
-            '<<<TAB_ORDER>>>':         tab_block,
-            '<<<WIDGET_LAYOUT>>>':     layout_block,
-            '<<<SET_FOCUS>>>':         set_focus,
-            '<<<FLAME_MENUS>>>':       flame_menus,
-        }
-        for marker, value in subs.items():
-            tmpl = tmpl.replace(marker, value)
-        return tmpl
-
-    @classmethod
-    def _build_widget_declarations(cls, widgets: list[PlacedWidget]) -> str:
-        """Return the widget instantiation block as a string (empty string if no widgets)."""
-        if not widgets:
-            return ''
-        type_order = list(WIDGET_SPECS.keys())
-        grouped: dict[str, list[PlacedWidget]] = {}
-        for w in widgets:
-            grouped.setdefault(w.widget_type, []).append(w)
-        sorted_types = sorted(
-            grouped.keys(),
-            key=lambda t: type_order.index(t) if t in type_order else 99,
-        )
-        lines = []
-        used_sections: set[str] = set()
-        for wtype in sorted_types:
-            section = cls._SECTION_LABELS.get(wtype, 'Widgets')
-            if section not in used_sections:
-                lines.append(f'        # {section}')
-                used_sections.add(section)
-            for w in grouped[wtype]:
-                var = w.var_name or f'{wtype.replace("PyFlame", "").lower()}_1'
-                lines.append(f'        self.{var} = {wtype}(')
-                kwargs = cls._widget_kwargs(wtype, w.properties)
-                for k, v in kwargs.items():
-                    lines.append(f'            {k}={v},')
-                if wtype == 'PyFlameButton' and 'connect' not in kwargs:
-                    callback_name = f'on_{var}_click'
-                    lines.append(f'            # connect={callback_name},  # TODO: Uncomment and implement callback')
-                if wtype == 'PyFlameTokenMenu' and 'token_dest' not in kwargs:
-                    lines.append("            # token_dest=self.entry_1,  # TODO: Connect token_dest to an Entry widget")
-                lines.append('            )')
-            lines.append('')
-        return '\n'.join(lines) + '\n'
-
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _script_type_label(hook_types: list) -> str:
-        types = [HOOK_TO_TYPE.get(h, h) for h in hook_types]
-        return ', '.join(types) if types else 'Batch'
-
-    @staticmethod
-    def _menu_path(config: WindowConfig) -> str:
-        name  = config.script_name
-        paths = []
-        for hook in config.hook_types:
-            if 'main_menu' in hook:
-                paths.append(f'Flame Main Menu -> Logik -> {name}')
-            elif 'batch' in hook:
-                paths.append(f'Flame Batch -> Right-click -> {name}')
-            elif 'media_panel' in hook:
-                paths.append(f'Flame Media Panel -> Right-click -> {name}')
-            elif 'media_hub' in hook:
-                paths.append(f'Flame Media Hub -> Right-click -> {name}')
-            elif 'timeline' in hook:
-                paths.append(f'Flame Timeline -> Right-click -> {name}')
-        return ('\n    '.join(paths)) if paths else name
-
-    @staticmethod
-    def _scope_stubs(hook_types: list) -> list:
-        """Emit one scope function per unique scope needed across all selected hooks."""
-        lines   = []
-        emitted = set()
-        for hook in hook_types:
-            scope_fn = HOOK_SCOPE.get(hook)
-            if scope_fn is None or scope_fn in emitted:
-                continue
-            lines += SCOPE_DEFS[scope_fn]
-            lines.append('')
-            emitted.add(scope_fn)
-        return lines
-
-    @staticmethod
-    def _menu_hook(config: WindowConfig, classname: str) -> list:
-        """Emit one hook function per selected hook."""
-        name  = config.script_name
-        min_version = config.flame_version
-        lines = []
-        for hook in config.hook_types:
-            if 'main_menu' in hook:
-                lines += [
-                    f'def {hook}():',
-                    '',
-                    '    return [',
-                    '        {',
-                    "            'name': 'Logik',",
-                    "            'hierarchy': [],",
-                    "            'actions': []",
-                    '        },',
-                    '        {',
-                    f"            'name': '{name}',",
-                    "            'hierarchy': ['Logik'],",
-                    "            'order': 2,",
-                    "            'actions': [",
-                    '               {',
-                    f"                    'name': '{name}',",
-                    f"                    'execute': {classname},",
-                    f"                    'minimumVersion': '{min_version}'",
-                    '               }',
-                    '           ]',
-                    '        }',
-                    '    ]',
-                    '',
-                ]
-            else:
-                action = [
-                    f"                    'name': '{name}',",
-                    f"                    'execute': {classname},",
-                ]
-                action.append(f"                    'minimumVersion': '{min_version}'")
-                lines += [
-                    f'def {hook}():',
-                    '',
-                    '    return [',
-                    '        {',
-                    f"            'name': '{name}',",
-                    "            'actions': [",
-                    '                {',
-                ] + action + [
-                    '                }',
-                    '            ]',
-                    '        }',
-                    '    ]',
-                    '',
-                ]
-        return lines
-
-    @staticmethod
-    def _widget_kwargs(widget_type: str, props: dict) -> dict:
-        """Convert props to Python-source string representations."""
-        specs = WIDGET_SPECS.get(widget_type, {})
-        prop_defs = {p.name: p for p in specs.get('props', [])}
-        result = {}
-        for key, val in props.items():
-            if key not in prop_defs:
-                continue
-            pdef = prop_defs[key]
-            if pdef.kind == 'connect':
-                # Emit as an unquoted Python identifier; skip if unset.
-                # For PyFlameButton, this will be emitted when user selected a callback;
-                # otherwise _build_widget_declarations adds a commented TODO hint.
-                if val:
-                    result[key] = str(val)
-            elif pdef.kind == 'token_dest':
-                if val:
-                    result[key] = f'self.{val}'
-            elif pdef.kind == 'enum':
-                if widget_type == 'PyFlameColorMenu' and key == 'color':
-                    result[key] = repr(str(val) if val is not None else 'No Color')
-                else:
-                    enum_class = ENUM_PROP_MAP.get(key, '')
-                    result[key] = f'{enum_class}.{val}' if enum_class else repr(val)
-            elif pdef.kind == 'bool':
-                result[key] = 'True' if val else 'False'
-            elif pdef.kind == 'int':
-                try:
-                    result[key] = str(int(val))
-                except (TypeError, ValueError):
-                    result[key] = str(pdef.default)
-            elif pdef.kind == 'list':
-                if isinstance(val, list):
-                    result[key] = repr(val)
-                elif isinstance(val, str):
-                    items = [x.strip() for x in val.splitlines() if x.strip()]
-                    result[key] = repr(items)
-                else:
-                    result[key] = '[]'
-            else:
-                result[key] = repr(str(val) if val is not None else '')
-        return result
-
-
-# ==============================================================================
-# ProjectSerializer
-# ==============================================================================
-
-class ProjectSerializer:
-
-    @staticmethod
-    def save(path: str, config: WindowConfig, widgets: list[PlacedWidget]) -> None:
-        data = {
-            'config': {
-                'script_name':    config.script_name,
-                'written_by':     config.written_by,
-                'script_version': config.script_version,
-                'flame_version':  config.flame_version,
-                'hook_types':     config.hook_types,
-                'license_type':   config.license_type,
-                'grid_columns':   config.grid_columns,
-                'grid_rows':      config.grid_rows,
-                'column_width':   config.column_width,
-                'row_height':     config.row_height,
-            },
-            'widgets': [
-                {
-                    'widget_type': w.widget_type,
-                    'row':         w.row,
-                    'col':         w.col,
-                    'row_span':    w.row_span,
-                    'col_span':    w.col_span,
-                    'properties':  w.properties,
-                    'var_name':    w.var_name,
-                }
-                for w in widgets
-            ],
-        }
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
-
-    @staticmethod
-    def load(path: str) -> tuple[WindowConfig, list[PlacedWidget]]:
-        with open(path) as f:
-            data = json.load(f)
-        cfg = data.get('config', {})
-        # Backward compat: old files stored hook_type as a string
-        raw_hooks = cfg.get('hook_types', cfg.get('hook_type', 'get_batch_custom_ui_actions'))
-        if isinstance(raw_hooks, str):
-            raw_hooks = [raw_hooks]
-
-        config = WindowConfig(
-            script_name    = cfg.get('script_name',    'My Script'),
-            written_by     = cfg.get('written_by',     'Your Name'),
-            script_version = cfg.get('script_version', 'v1.0.0'),
-            flame_version  = cfg.get('flame_version',  '2025.1'),
-            hook_types     = raw_hooks,
-            license_type   = cfg.get('license_type',   'GPL-3.0'),
-            grid_columns   = cfg.get('grid_columns',   4),
-            grid_rows      = cfg.get('grid_rows',      3),
-            column_width   = cfg.get('column_width',   150),
-            row_height     = cfg.get('row_height',     28),
-        )
-        widgets = []
-        for wd in data.get('widgets', []):
-            w = PlacedWidget(
-                widget_type = wd.get('widget_type', ''),
-                row         = wd.get('row',         0),
-                col         = wd.get('col',         0),
-                row_span    = wd.get('row_span',    1),
-                col_span    = wd.get('col_span',    1),
-                properties  = wd.get('properties',  {}),
-                var_name    = wd.get('var_name',    ''),
-            )
-            widgets.append(w)
-        return config, widgets
+WidgetContainer.configure(
+    props_to_kwargs=_props_to_kwargs,
+    make_fallback_widget=_make_fallback_widget,
+    widget_class_getter=lambda name: globals().get(name),
+    pyflame_loaded=_pyflame_loaded,
+    progress_preview_cls=ProgressBarPreview,
+    allowed_handle_ids=_allowed_handle_ids,
+    handle_rects=_handle_rects,
+    chrome_title_h=CHROME_TITLE_H,
+    chrome_side_w=CHROME_SIDE_W,
+)
 
 
 # ==============================================================================
@@ -2905,72 +890,35 @@ def _app_stylesheet() -> str:
             .replace('__CHECKBOX_CHECKED__', checked))
 
 
-# ==============================================================================
-# Help
-# ==============================================================================
+def _patch_messagebox_no_icons() -> None:
+    """Force static QMessageBox helpers to use NoIcon (no !/? glyphs)."""
 
-class HelpDialog(QDialog):
-    def __init__(self, parent=None, initial_file: str | None = None):
-        super().__init__(parent)
-        self.setWindowTitle('Help')
-        self.resize(900, 640)
-        self.setStyleSheet(_app_stylesheet())
+    def _show(parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton):
+        msg = QMessageBox(parent)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setIcon(QMessageBox.NoIcon)
+        msg.setStandardButtons(buttons)
+        if defaultButton not in (None, QMessageBox.NoButton):
+            msg.setDefaultButton(defaultButton)
+        return msg.exec()
 
-        self.help_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs', 'help')
-        self.help_files = {
-            'Getting Started': 'getting-started.md',
-            'Keyboard Shortcuts': 'keyboard-shortcuts.md',
-        }
-
-        layout = QVBoxLayout(self)
-        splitter = QSplitter(Qt.Horizontal)
-
-        self.nav = QListWidget()
-        for title in self.help_files.keys():
-            self.nav.addItem(title)
-        self.nav.currentTextChanged.connect(self._load_topic)
-
-        self.viewer = QTextBrowser()
-        self.viewer.setOpenExternalLinks(True)
-        self.viewer.setStyleSheet(
-            'background: #1a1a1a; color: #c8c8c8; border: 1px solid #3a3a3a;'
-            ' font-family: "Montserrat", "Arial"; font-size: 13px;'
-        )
-
-        splitter.addWidget(self.nav)
-        splitter.addWidget(self.viewer)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([220, 680])
-
-        layout.addWidget(splitter)
-
-        close_row = QHBoxLayout()
-        close_row.addStretch()
-        close_btn = QPushButton('Close')
-        close_btn.clicked.connect(self.accept)
-        close_row.addWidget(close_btn)
-        layout.addLayout(close_row)
-
-        # Select initial section
-        idx = 0
-        if initial_file:
-            files = list(self.help_files.values())
-            if initial_file in files:
-                idx = files.index(initial_file)
-        self.nav.setCurrentRow(idx)
-
-    def _load_topic(self, title: str):
-        filename = self.help_files.get(title)
-        if not filename:
-            return
-        path = os.path.join(self.help_dir, filename)
-        if not os.path.exists(path):
-            self.viewer.setPlainText(f'Help file missing:\n{path}')
-            return
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        self.viewer.setMarkdown(content)
+    QMessageBox.information = staticmethod(
+        lambda parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton:
+        _show(parent, title, text, buttons, defaultButton)
+    )
+    QMessageBox.warning = staticmethod(
+        lambda parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton:
+        _show(parent, title, text, buttons, defaultButton)
+    )
+    QMessageBox.critical = staticmethod(
+        lambda parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton:
+        _show(parent, title, text, buttons, defaultButton)
+    )
+    QMessageBox.question = staticmethod(
+        lambda parent, title, text, buttons=QMessageBox.Yes | QMessageBox.No, defaultButton=QMessageBox.NoButton:
+        _show(parent, title, text, buttons, defaultButton)
+    )
 
 
 # ==============================================================================
@@ -2985,6 +933,10 @@ class PyFlameBuilder(QMainWindow):
         self.resize(1400, 800)
 
         self.config = WindowConfig()
+        self.windows: list[ScriptWindow] = [
+            ScriptWindow(function_name='main_window', grid_columns=self.config.grid_columns, grid_rows=self.config.grid_rows, widgets=[])
+        ]
+        self.active_window_index = 0
         self._dirty = False
         self._save_path: str | None = None
 
@@ -2992,12 +944,51 @@ class PyFlameBuilder(QMainWindow):
         self._preview_visible = True
         self._preview_center_on_change = True
         self._last_preview_code = ''
+        self._raw_import_code: str | None = None
+        self._preview_user_edited = False
+        self._suppress_preview_text_signal = False
+        self._api_preview_highlight_active = False
+        self._active_work_panel = None
+        self._active_aux_panel = None
+        self._last_find_text = ''
+        self._last_replace_text = ''
+        self._find_match_case = False
+        self._find_whole_word = False
+        self._find_regex = False
+        self._replace_in_selection = False
+        self._recent_searches: list[str] = []
+        self._grid_was_on_before_preview = False
+        self._main_split_sizes_before_preview_hide: list[int] | None = None
         self._preview_timer = QTimer(self)
+        self._code_to_ui_sync_timer = QTimer(self)
+        self._code_to_ui_sync_timer.setSingleShot(True)
+        self._code_to_ui_sync_timer.setInterval(220)
+        self._code_to_ui_sync_timer.timeout.connect(self._sync_canvas_from_preview_code_best_effort)
+        self._generated_code_snapshot = ''
+        self._bookmark_lines: set[int] = set()
+        self._cursor_history: list[int] = []
+        self._cursor_history_index = -1
+        self._cursor_history_nav = False
 
         self._history_limit = 10
         self._history: list[dict] = []
         self._history_index = -1
         self._restoring_history = False
+
+        self._api_queue: queue.Queue = queue.Queue()
+        self._api_server = None
+        self._api_thread = None
+        self._api_timer = QTimer(self)
+        self._api_timer.setInterval(80)
+        self._api_timer.timeout.connect(self._process_api_requests)
+        self._api_timer.start()
+
+        try:
+            self._flame_available: bool = importlib.util.find_spec('flame') is not None
+        except ValueError:
+            # flame is in sys.modules with __spec__ = None (Flame's custom loader)
+            self._flame_available = 'flame' in sys.modules
+
         self._preview_timer.setSingleShot(True)
         self._preview_timer.timeout.connect(self._refresh_preview)
 
@@ -3005,26 +996,167 @@ class PyFlameBuilder(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._connect_signals()
+        self._restore_window_layout_settings()
+        # Global click handling for deselection outside canvas.
+        QApplication.instance().installEventFilter(self)
+        # Ensure startup shows window properties when no widget is selected.
+        self._show_active_window_properties()
         self._update_title()
         self._record_history_state()
         self._update_undo_redo_actions()
+        self._start_preview_api_if_enabled()
+        QTimer.singleShot(0, self._show_whats_new_if_needed)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _extract_hover_hints_from_pyflame_lib(path: str) -> dict[str, str]:
+        """Build symbol->hint map from class/function docstrings in pyflame_lib.py.
+
+        VS Code-like intent:
+        - Prefer full-symbol hover text with a signature/header line.
+        - For classes, fall back to __init__ docstring when class docstring is missing.
+        """
+        hints: dict[str, str] = {}
+        try:
+            # Read full file (no truncation) so AST parse remains valid.
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                code = f.read()
+            if not code:
+                return hints
+            tree = ast.parse(code)
+        except Exception:
+            return hints
+
+        def _doc_body(doc: str) -> str:
+            raw_lines = (doc or '').splitlines()
+            # Keep paragraph spacing but trim outer blank lines for a cleaner popup.
+            while raw_lines and not raw_lines[0].strip():
+                raw_lines.pop(0)
+            while raw_lines and not raw_lines[-1].strip():
+                raw_lines.pop()
+            return '\n'.join(raw_lines).strip()
+
+        def _func_sig(fn_node: ast.AST, name: str) -> str:
+            try:
+                if not isinstance(fn_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return f'{name}(...)'
+                args = []
+                for a in fn_node.args.args:
+                    if a.arg == 'self':
+                        continue
+                    args.append(a.arg)
+                if fn_node.args.vararg:
+                    args.append('*' + fn_node.args.vararg.arg)
+                for a in fn_node.args.kwonlyargs:
+                    args.append(a.arg)
+                if fn_node.args.kwarg:
+                    args.append('**' + fn_node.args.kwarg.arg)
+                return f"{name}({', '.join(args)})"
+            except Exception:
+                return f'{name}(...)'
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = node.name
+                doc = ast.get_docstring(node) or ''
+                if not doc.strip():
+                    continue
+                body = _doc_body(doc)
+                sig = _func_sig(node, name)
+                hints[name] = f"{sig}\n{body}" if body else sig
+                continue
+
+            if isinstance(node, ast.ClassDef):
+                name = node.name
+                class_doc = ast.get_docstring(node) or ''
+                init_node = next((n for n in node.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == '__init__'), None)
+                init_doc = ast.get_docstring(init_node) if init_node is not None else ''
+                doc = class_doc or init_doc or ''
+                if not doc.strip():
+                    continue
+                body = _doc_body(doc)
+                sig = _func_sig(init_node, name) if init_node is not None else f'{name}(...)'
+                hints[name] = f"{sig}\n{body}" if body else sig
+
+        return hints
+
     def _build_ui(self):
-        self.config_bar = WindowConfigBar(self.config)
+        self.config_bar = WindowConfigBar(
+            self.config,
+            hook_display=HOOK_DISPLAY,
+            license_types=list(LICENSE_DATA.keys()),
+        )
 
         # Canvas in a scroll area
-        self.canvas = CanvasWidget(self.config)
+        self.canvas = CanvasWidget(
+            self.config,
+            widget_specs=WIDGET_SPECS,
+            widget_container_cls=WidgetContainer,
+            chrome_title_h=CHROME_TITLE_H,
+            chrome_msg_h=CHROME_MSG_H,
+            chrome_side_w=CHROME_SIDE_W,
+            cell_gap=CELL_GAP,
+        )
         self.canvas_scroll = PannableScrollArea()
         self.canvas_scroll.setWidget(self.canvas)
         self.canvas_scroll.setWidgetResizable(False)
         self.canvas_scroll.setAlignment(Qt.AlignCenter)
         self.canvas_scroll.setStyleSheet('QScrollArea { background: #171717; }')
 
+        self.window_tabs = QTabBar()
+        self.window_tabs.setMovable(False)
+        self.window_tabs.setTabsClosable(True)
+        # Selected tab highlight for clearer active-window context.
+        self.window_tabs.setStyleSheet(
+            """
+            QTabBar::tab {
+                background: #262626;
+                color: #bdbdbd;
+                border: 1px solid #3f3f3f;
+                padding: 4px 10px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background: #343434;
+                color: #d0d0d0;
+                border: 1px solid #4a4a4a;
+            }
+            QTabBar::tab:hover {
+                background: #2e2e2e;
+            }
+            """
+        )
+        self.window_tabs.tabCloseRequested.connect(self.action_remove_window_tab)
+        self.window_tabs.tabBarDoubleClicked.connect(self._on_window_tab_double_clicked)
+        self.window_tabs.currentChanged.connect(self._on_window_tab_changed)
+        self.window_tabs.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.window_tabs.customContextMenuRequested.connect(self._show_window_tab_menu)
+
+        self.window_add_btn = QPushButton('+')
+        self.window_add_btn.setFixedSize(24, 22)
+        self.window_add_btn.setToolTip('Add Window')
+        self.window_add_btn.clicked.connect(self.action_add_window_tab)
+
+        self.window_remove_btn = QPushButton('−')
+        self.window_remove_btn.setFixedSize(24, 22)
+        self.window_remove_btn.setToolTip('Remove Current Window')
+        self.window_remove_btn.clicked.connect(lambda: self.action_remove_window_tab(self.active_window_index))
+
+        self.window_tab_row = QWidget()
+        tab_row_layout = QHBoxLayout(self.window_tab_row)
+        tab_row_layout.setContentsMargins(0, 0, 0, 0)
+        tab_row_layout.setSpacing(4)
+        tab_row_layout.addWidget(self.window_tabs, 1)
+        tab_row_layout.addWidget(self.window_add_btn)
+        tab_row_layout.addWidget(self.window_remove_btn)
+
+        self._rebuild_window_tabs()
+
         # Palette
-        self.palette = WidgetPalette()
+        self.palette = WidgetPalette(widget_specs=WIDGET_SPECS)
         self.palette_panel = QWidget()
+        self.palette_panel.setObjectName('WidgetPalettePanelFrame')
         palette_layout = QVBoxLayout(self.palette_panel)
         palette_layout.setContentsMargins(4, 4, 4, 4)
         palette_layout.setSpacing(4)
@@ -3034,62 +1166,171 @@ class PyFlameBuilder(QMainWindow):
         palette_layout.addWidget(self.palette)
 
         # Properties
-        self.props = PropertiesPanel()
+        self.props = PropertiesPanel(
+            widget_specs=WIDGET_SPECS,
+            parse_template_callbacks=_parse_template_callbacks,
+            widget_factory=WidgetContainer,
+        )
+        self.props_frame = QFrame()
+        self.props_frame.setObjectName('PropertiesPanelFrame')
+        self.props_frame.setFrameShape(QFrame.NoFrame)
+        _pf_layout = QVBoxLayout(self.props_frame)
+        _pf_layout.setContentsMargins(0, 0, 0, 0)
+        _pf_layout.setSpacing(0)
+        _pf_layout.addWidget(self.props)
 
         # Right pane: palette (top) + properties (bottom)
-        right = QSplitter(Qt.Vertical)
-        right.addWidget(self.palette_panel)
-        right.addWidget(self.props)
-        right.setStretchFactor(0, 1)
-        right.setStretchFactor(1, 2)
+        self.right_split = QSplitter(Qt.Vertical)
+        self.right_split.addWidget(self.palette_panel)
+        self.right_split.addWidget(self.props_frame)
+        self.right_split.setStretchFactor(0, 1)
+        self.right_split.setStretchFactor(1, 3)
+        # Tune default vertical split: reduce Properties height ~20% from prior default.
+        self.right_split.setSizes([344, 496])
 
         # Live preview panel (left)
         self.preview_panel = QWidget()
+        self.preview_panel.setObjectName('CodePreviewPanelFrame')
         pv = QVBoxLayout(self.preview_panel)
         pv.setContentsMargins(6, 6, 6, 6)
         pv.setSpacing(6)
 
-        preview_title = QLabel('Live Code Preview')
+        preview_title = QLabel('Code Editor')
         preview_title.setStyleSheet('color: #888; font-size: 11px; padding: 2px 2px 0px;')
         pv.addWidget(preview_title)
 
         preview_controls = QHBoxLayout()
-        self.preview_auto_check = QCheckBox('Auto')
+        self.preview_auto_check = QCheckBox('Auto Update Code')
         self.preview_auto_check.setChecked(True)
         self.preview_auto_check.toggled.connect(self._set_preview_auto)
-        self.preview_copy_btn = QPushButton('Copy')
-        self.preview_copy_btn.clicked.connect(self._copy_preview)
+        self.preview_export_btn = QPushButton('Export')
+        self.preview_export_btn.clicked.connect(self._generate_script)
         self.preview_close_btn = QPushButton('✕')
         self.preview_close_btn.setFixedWidth(28)
         self.preview_close_btn.clicked.connect(lambda: self._set_preview_visible(False))
         preview_controls.addWidget(self.preview_auto_check)
         preview_controls.addStretch()
-        preview_controls.addWidget(self.preview_copy_btn)
+        preview_controls.addWidget(self.preview_export_btn)
         preview_controls.addWidget(self.preview_close_btn)
         pv.addLayout(preview_controls)
 
-        self.preview_text = QPlainTextEdit()
-        self.preview_text.setReadOnly(True)
+        self.find_bar = QWidget()
+        self.find_bar.setObjectName('CodeFindBar')
+        self.find_bar.setStyleSheet(
+            '#CodeFindBar { background: #232323; border: 1px solid #3a3a3a; border-radius: 3px; }'
+            '#CodeFindBar QLabel { color: #9a9a9a; }'
+        )
+        fb = QVBoxLayout(self.find_bar)
+        fb.setContentsMargins(8, 6, 8, 6)
+        fb.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        find_lbl = QLabel('Find')
+        repl_lbl = QLabel('Replace')
+
+        self.find_input = QComboBox()
+        self.find_input.setEditable(True)
+        self.find_input.setMinimumWidth(260)
+
+        self.replace_input = QLineEdit()
+        self.replace_input.setPlaceholderText('Replacement text')
+        self.replace_input.setMinimumWidth(260)
+
+        self.find_bar_match_case = QCheckBox('Match Case')
+        self.find_bar_whole_word = QCheckBox('Whole Word')
+        self.find_bar_regex = QCheckBox('Regex')
+        self.find_bar_sel_only = QCheckBox('In Selection')
+        self.find_bar_match_case.setToolTip('Case-sensitive search')
+        self.find_bar_whole_word.setToolTip('Match whole words only')
+        self.find_bar_regex.setToolTip('Use regular expression pattern')
+        self.find_bar_sel_only.setToolTip('Apply replace operations to current selection only')
+
+        self.find_prev_btn = QPushButton('Prev')
+        self.find_next_btn = QPushButton('Next')
+        self.find_rep_btn = QPushButton('Replace')
+        self.find_rep_all_btn = QPushButton('Replace All')
+
+        self.find_close_btn = QPushButton('✕')
+        self.find_close_btn.setFixedWidth(28)
+        self.find_close_btn.setToolTip('Close find bar')
+
+        row1.addWidget(find_lbl)
+        row1.addWidget(self.find_input, 1)
+        row1.addWidget(self.find_prev_btn)
+        row1.addWidget(self.find_next_btn)
+        row1.addWidget(self.find_close_btn)
+
+        row2.addWidget(repl_lbl)
+        row2.addWidget(self.replace_input, 1)
+        row2.addWidget(self.find_rep_btn)
+        row2.addWidget(self.find_rep_all_btn)
+        row2.addWidget(self.find_bar_match_case)
+        row2.addWidget(self.find_bar_whole_word)
+        row2.addWidget(self.find_bar_regex)
+        row2.addWidget(self.find_bar_sel_only)
+
+        fb.addLayout(row1)
+        fb.addLayout(row2)
+
+        self.find_bar.setVisible(False)
+        pv.addWidget(self.find_bar)
+
+        self.preview_text = SpacesTabPlainTextEdit()
+        self.preview_text.setReadOnly(False)
+        self.preview_text.setPlaceholderText('Generated code appears here. You can edit manually.')
+        hover_hints = {
+            'PyFlameWindow': 'PyFlameWindow(...)\nMain application window container.\nCommon args: title, parent, grid_layout_columns, grid_layout_rows, window_margins.',
+            'Color': 'Color enum\nUsed by color-capable widgets (buttons/lines/etc).',
+            'Align': 'Align enum\nText alignment options: LEFT, CENTER, RIGHT.',
+            'Style': 'Style enum\nVisual style variants used by selected widgets.',
+            'TextType': 'TextType enum\nText format: PLAIN / MARKDOWN / HTML.',
+            'TextStyle': 'TextStyle enum\nText behavior: EDITABLE / READ_ONLY / UNSELECTABLE.',
+            'BrowserType': 'BrowserType enum\nEntry browser mode: FILE or DIRECTORY.',
+        }
+        # Enrich hints from pyflame_lib docstrings when available.
+        hover_hints.update(self._extract_hover_hints_from_pyflame_lib(PYFLAME_LIB_PATH))
+
+        for wt, spec in WIDGET_SPECS.items():
+            display = spec.get('display', wt)
+            hover_hints.setdefault(wt, f'{wt}(...)\nWidget: {display}')
+        self.preview_text.set_hover_hints(hover_hints)
         self.preview_text.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.preview_text.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.preview_text.setStyleSheet(self._preview_style())
         pv.addWidget(self.preview_text)
 
+        self.preview_status_label = QLabel('Ln 1, Col 1 | Sel 0 | generated')
+        self.preview_status_label.setStyleSheet('color: #888; font-size: 10px; padding: 2px 2px 0px;')
+        pv.addWidget(self.preview_status_label)
+
         # Center pane: canvas area + local bottom zoom controls
-        center_pane = QWidget()
-        center_layout = QVBoxLayout(center_pane)
+        self.center_pane = QWidget()
+        center_layout = QVBoxLayout(self.center_pane)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(0)
+        ui_title = QLabel('UI Preview')
+        ui_title.setStyleSheet('color: #888; font-size: 11px; padding: 4px 4px 2px;')
+        center_layout.addWidget(ui_title)
+        center_layout.addWidget(self.window_tab_row)
         center_layout.addWidget(self.canvas_scroll)
 
-        zoom_bar = QWidget()
-        zoom_layout = QHBoxLayout(zoom_bar)
+        self.zoom_bar = QWidget()
+        zoom_layout = QHBoxLayout(self.zoom_bar)
         zoom_layout.setContentsMargins(8, 4, 8, 4)
         zoom_layout.setSpacing(6)
         self.grid_toggle_btn = QPushButton('Grid: Off')
         self.grid_toggle_btn.setFixedHeight(22)
         self.grid_toggle_btn.clicked.connect(self.action_toggle_grid_visibility)
         zoom_layout.addWidget(self.grid_toggle_btn)
+
+        self.preview_mode_btn = QPushButton('Preview: Off')
+        self.preview_mode_btn.setFixedHeight(22)
+        self.preview_mode_btn.clicked.connect(self.action_toggle_preview_mode)
+        zoom_layout.addWidget(self.preview_mode_btn)
 
         zoom_layout.addStretch()
 
@@ -3121,13 +1362,13 @@ class PyFlameBuilder(QMainWindow):
 
 
         center_layout.addWidget(self._separator())
-        center_layout.addWidget(zoom_bar)
+        center_layout.addWidget(self.zoom_bar)
 
-        # Main horizontal splitter
+        # Main horizontal splitter  (preview | canvas | properties)
         self.main_split = QSplitter(Qt.Horizontal)
         self.main_split.addWidget(self.preview_panel)
-        self.main_split.addWidget(center_pane)
-        self.main_split.addWidget(right)
+        self.main_split.addWidget(self.center_pane)
+        self.main_split.addWidget(self.right_split)
         self.main_split.setStretchFactor(0, 0)
         self.main_split.setStretchFactor(1, 1)
         self.main_split.setStretchFactor(2, 0)
@@ -3146,17 +1387,24 @@ class PyFlameBuilder(QMainWindow):
         vbox.addWidget(main_split)
 
         self.setCentralWidget(central)
+        self._set_active_panel(None)
+        self._update_mode_toggle_button_styles()
 
     def _separator(self):
         f = QFrame()
-        f.setFrameShape(QFrame.HLine)
+        # Use a plain 1px block instead of QFrame.HLine so Qt palette doesn't
+        # draw a bright bevel line on some platforms/themes.
+        f.setFrameShape(QFrame.NoFrame)
         f.setFixedHeight(1)
-        f.setStyleSheet('background: #3a3a3a;')
+        f.setStyleSheet('background-color: #3f3f3f; border: none;')
         return f
 
     def _build_menu(self):
+        """Build top-level menus and action wiring."""
         mb = self.menuBar()
         mb.setNativeMenuBar(False)
+
+        # File menu: project lifecycle + import/export script flows.
         fm = mb.addMenu('File')
 
         new_a = QAction('New', self)
@@ -3164,37 +1412,36 @@ class PyFlameBuilder(QMainWindow):
         new_a.triggered.connect(self._new)
         fm.addAction(new_a)
 
-        load_a = QAction('Load...', self)
+        load_a = QAction('Load Project...', self)
         load_a.setShortcut(QKeySequence.Open)
         load_a.triggered.connect(self._open)
         fm.addAction(load_a)
 
-        self._recent_menu = fm.addMenu('Load Recent')
+        self._recent_menu = fm.addMenu('Load Recent Project')
         self._rebuild_recent_menu()
 
         fm.addSeparator()
 
-        save_a = QAction('Save', self)
+        save_a = QAction('Save Project', self)
         save_a.setShortcut(QKeySequence.Save)
         save_a.triggered.connect(self._save)
         fm.addAction(save_a)
 
-        saveas_a = QAction('Save As...', self)
+        saveas_a = QAction('Save Project As...', self)
         saveas_a.setShortcut(QKeySequence('Ctrl+Shift+S'))
         saveas_a.triggered.connect(self._save_as)
         fm.addAction(saveas_a)
 
         fm.addSeparator()
 
-        preview_a = QAction('Preview Code...', self)
-        preview_a.setShortcut(QKeySequence('Ctrl+G'))
-        preview_a.triggered.connect(self._generate_code)
-        fm.addAction(preview_a)
-
-        generate_a = QAction('Generate Script...', self)
+        generate_a = QAction('Export Script...', self)
         generate_a.setShortcut(QKeySequence('Ctrl+Shift+G'))
         generate_a.triggered.connect(self._generate_script)
         fm.addAction(generate_a)
+
+        export_ui_only_a = QAction('Export UI Code Only...', self)
+        export_ui_only_a.triggered.connect(self._export_ui_code_only)
+        fm.addAction(export_ui_only_a)
 
         fm.addSeparator()
 
@@ -3203,6 +1450,7 @@ class PyFlameBuilder(QMainWindow):
         exit_a.triggered.connect(self.close)
         fm.addAction(exit_a)
 
+        # Edit menu: undo/redo, window tabs, and code-edit helpers.
         self.edit_menu = mb.addMenu('Edit')
         self.undo_action = QAction('Undo', self)
         self.undo_action.setShortcut(QKeySequence.Undo)
@@ -3212,38 +1460,163 @@ class PyFlameBuilder(QMainWindow):
         self.redo_action.setShortcut(QKeySequence('Ctrl+Shift+Z'))
         self.redo_action.triggered.connect(self.action_redo)
 
+        self.comment_selection_action = QAction('Comment Selection', self)
+        self.comment_selection_action.triggered.connect(self.action_comment_selection)
+
+        self.uncomment_selection_action = QAction('Uncomment Selection', self)
+        self.uncomment_selection_action.triggered.connect(self.action_uncomment_selection)
+
+        self.toggle_comment_selection_action = QAction('Toggle Comment Selection', self)
+        self.toggle_comment_selection_action.setShortcut(QKeySequence('Ctrl+/'))
+        self.toggle_comment_selection_action.triggered.connect(self.action_toggle_comment_selection)
+
+        self.find_action = QAction('Find...', self)
+        self.find_action.setShortcut(QKeySequence('Ctrl+F'))
+        self.find_action.triggered.connect(self.action_find)
+
+        self.find_next_action = QAction('Find Next', self)
+        self.find_next_action.setShortcut(QKeySequence('F3'))
+        self.find_next_action.triggered.connect(self.action_find_next)
+
+        self.find_prev_action = QAction('Find Previous', self)
+        self.find_prev_action.setShortcut(QKeySequence('Shift+F3'))
+        self.find_prev_action.triggered.connect(self.action_find_previous)
+
+        self.replace_action = QAction('Replace...', self)
+        self.replace_action.setShortcut(QKeySequence('Ctrl+H'))
+        self.replace_action.triggered.connect(self.action_replace)
+
+        self.goto_line_action = QAction('Go to Line...', self)
+        self.goto_line_action.setShortcut(QKeySequence('Ctrl+L'))
+        self.goto_line_action.triggered.connect(self.action_go_to_line)
+
+        self.find_match_case_action = QAction('Match Case', self)
+        self.find_match_case_action.setCheckable(True)
+        self.find_match_case_action.setChecked(self._find_match_case)
+        self.find_match_case_action.toggled.connect(self._set_find_match_case)
+
+        self.find_whole_word_action = QAction('Whole Word', self)
+        self.find_whole_word_action.setCheckable(True)
+        self.find_whole_word_action.setChecked(self._find_whole_word)
+        self.find_whole_word_action.toggled.connect(self._set_find_whole_word)
+
+        self.find_regex_action = QAction('Regex Mode', self)
+        self.find_regex_action.setCheckable(True)
+        self.find_regex_action.setChecked(self._find_regex)
+        self.find_regex_action.toggled.connect(self._set_find_regex)
+
+        self.replace_in_selection_action = QAction('Replace in Selection', self)
+        self.replace_in_selection_action.setCheckable(True)
+        self.replace_in_selection_action.setChecked(self._replace_in_selection)
+        self.replace_in_selection_action.toggled.connect(self._set_replace_in_selection)
+
+        self.inline_find_action = QAction('Inline Find Bar', self)
+        self.inline_find_action.setShortcut(QKeySequence('Ctrl+Shift+F'))
+        self.inline_find_action.triggered.connect(self.action_toggle_inline_find_bar)
+
+        self.duplicate_line_action = QAction('Duplicate Line / Selection', self)
+        self.duplicate_line_action.setShortcut(QKeySequence('Ctrl+D'))
+        self.duplicate_line_action.triggered.connect(self.action_duplicate_selection_or_line)
+
+        self.move_line_up_action = QAction('Move Line / Selection Up', self)
+        self.move_line_up_action.setShortcut(QKeySequence('Alt+Up'))
+        self.move_line_up_action.triggered.connect(lambda: self.action_move_selection_or_line(-1))
+
+        self.move_line_down_action = QAction('Move Line / Selection Down', self)
+        self.move_line_down_action.setShortcut(QKeySequence('Alt+Down'))
+        self.move_line_down_action.triggered.connect(lambda: self.action_move_selection_or_line(1))
+
+        self.trim_whitespace_action = QAction('Trim Trailing Whitespace', self)
+        self.trim_whitespace_action.triggered.connect(self.action_trim_trailing_whitespace)
+
+        self.normalize_tabs_action = QAction('Normalize Tabs to Spaces', self)
+        self.normalize_tabs_action.triggered.connect(self.action_normalize_tabs_to_spaces)
+
+        self.toggle_bookmark_action = QAction('Toggle Bookmark', self)
+        self.toggle_bookmark_action.setShortcut(QKeySequence('F2'))
+        self.toggle_bookmark_action.triggered.connect(self.action_toggle_bookmark)
+
+        self.next_bookmark_action = QAction('Next Bookmark', self)
+        self.next_bookmark_action.setShortcut(QKeySequence('Ctrl+F2'))
+        self.next_bookmark_action.triggered.connect(self.action_next_bookmark)
+
+        self.prev_bookmark_action = QAction('Previous Bookmark', self)
+        self.prev_bookmark_action.setShortcut(QKeySequence('Ctrl+Shift+F2'))
+        self.prev_bookmark_action.triggered.connect(self.action_prev_bookmark)
+
+        self.cursor_back_action = QAction('Cursor Back', self)
+        self.cursor_back_action.setShortcut(QKeySequence('Alt+Left'))
+        self.cursor_back_action.triggered.connect(lambda: self.action_cursor_history(-1))
+
+        self.cursor_forward_action = QAction('Cursor Forward', self)
+        self.cursor_forward_action.setShortcut(QKeySequence('Alt+Right'))
+        self.cursor_forward_action.triggered.connect(lambda: self.action_cursor_history(1))
+
+        self.open_symbol_action = QAction('Open Symbol...', self)
+        self.open_symbol_action.setShortcut(QKeySequence('Ctrl+Shift+O'))
+        self.open_symbol_action.triggered.connect(self.action_open_symbol)
+
+        self.fold_current_action = QAction('Fold/Unfold Current Block', self)
+        self.fold_current_action.setShortcut(QKeySequence('Ctrl+Shift+['))
+        self.fold_current_action.triggered.connect(self.action_toggle_fold_current)
+
+        self.unfold_all_action = QAction('Unfold All Blocks', self)
+        self.unfold_all_action.setShortcut(QKeySequence('Ctrl+Shift+]'))
+        self.unfold_all_action.triggered.connect(self.action_unfold_all)
+
+        self.lint_check_action = QAction('Lint Check', self)
+        self.lint_check_action.triggered.connect(self.action_lint_check)
+
+        self.snapshot_compare_action = QAction('Compare Generated vs Editor...', self)
+        self.snapshot_compare_action.triggered.connect(self.action_snapshot_compare)
+
+        self.add_window_action = QAction('Add Window...', self)
+        self.add_window_action.setShortcut(QKeySequence('Ctrl+T'))
+        self.add_window_action.triggered.connect(self.action_add_window_tab)
+
+        self.rename_window_action = QAction('Rename Current Window...', self)
+        self.rename_window_action.triggered.connect(lambda: self.action_rename_window_tab(self.active_window_index))
+
+        self.remove_window_action = QAction('Remove Current Window...', self)
+        self.remove_window_action.triggered.connect(lambda: self.action_remove_window_tab(self.active_window_index))
+
         self._refresh_edit_menu()
         self.edit_menu.aboutToShow.connect(self._refresh_edit_menu)
 
+        # View menu: preview visibility + inspection actions.
         vm = mb.addMenu('View')
-        self.toggle_preview_action = QAction('Show Live Code Preview', self)
+        preview_a = QAction('Preview Code...', self)
+        preview_a.setShortcut(QKeySequence('Ctrl+G'))
+        preview_a.triggered.connect(self._generate_code)
+        vm.addAction(preview_a)
+
+        self.toggle_preview_action = QAction('Show Code Editor', self)
         self.toggle_preview_action.setCheckable(True)
         self.toggle_preview_action.setChecked(True)
         self.toggle_preview_action.toggled.connect(self._set_preview_visible)
         vm.addAction(self.toggle_preview_action)
 
         vm.addSeparator()
-        zoom_in_action = QAction('Zoom In', self)
-        zoom_in_action.setShortcut(QKeySequence('Ctrl+='))
-        zoom_in_action.triggered.connect(self.action_zoom_in)
-        vm.addAction(zoom_in_action)
+        reset_layout_action = QAction('Reset Layout to Default', self)
+        reset_layout_action.triggered.connect(self.action_reset_layout)
+        vm.addAction(reset_layout_action)
 
-        zoom_out_action = QAction('Zoom Out', self)
-        zoom_out_action.setShortcut(QKeySequence('Ctrl+-'))
-        zoom_out_action.triggered.connect(self.action_zoom_out)
-        vm.addAction(zoom_out_action)
-
-        zoom_reset_action = QAction('Actual Size (100%)', self)
-        zoom_reset_action.setShortcut(QKeySequence('Ctrl+0'))
-        zoom_reset_action.triggered.connect(self.action_zoom_reset)
-        vm.addAction(zoom_reset_action)
-
-        zoom_fit_action = QAction('Fit Canvas', self)
-        zoom_fit_action.setShortcut(QKeySequence('Ctrl+9'))
-        zoom_fit_action.triggered.connect(self.action_zoom_fit)
-        vm.addAction(zoom_fit_action)
-
+        # Help menu: docs, what's-new, and app metadata.
         hm = mb.addMenu('Help')
+
+        whats_new_menu = hm.addMenu("What's New")
+        versions = self._list_whats_new_versions()
+        if versions:
+            for ver in versions:
+                act = QAction(ver, self)
+                act.triggered.connect(lambda checked=False, v=ver: self.action_open_whats_new(v))
+                whats_new_menu.addAction(act)
+        else:
+            none_act = QAction('No entries', self)
+            none_act.setEnabled(False)
+            whats_new_menu.addAction(none_act)
+
+        hm.addSeparator()
 
         getting_started_action = QAction('Getting Started', self)
         getting_started_action.triggered.connect(lambda: self.action_open_help('getting-started.md'))
@@ -3258,19 +1631,651 @@ class PyFlameBuilder(QMainWindow):
         about_action.triggered.connect(self.action_about)
         hm.addAction(about_action)
 
+
     def _connect_signals(self):
+        """Connect Qt signals to state-mutating handlers."""
         self.config_bar.config_changed.connect(self._on_config_changed)
         self.canvas.widget_selected.connect(self._on_widget_selected)
         self.canvas.widget_moved.connect(self._on_widget_moved)
         self.canvas.grid_changed.connect(self._on_grid_changed)
         self.canvas.content_changed.connect(self._on_canvas_content_changed)
         self.props.properties_changed.connect(self._on_properties_changed)
+        self.props.panel_interacted.connect(lambda: self._set_active_panel('props'))
+        self.preview_text.textChanged.connect(self._on_preview_text_changed)
+        self.preview_text.cursorPositionChanged.connect(self._update_editor_status)
+        self.preview_text.protectedEditAttempted.connect(self._on_protected_edit_attempted)
+        self.preview_text.duplicateRequested.connect(self.action_duplicate_selection_or_line)
+        self.preview_text.moveUpRequested.connect(lambda: self.action_move_selection_or_line(-1))
+        self.preview_text.moveDownRequested.connect(lambda: self.action_move_selection_or_line(1))
+        self.preview_text.bookmarkToggleRequested.connect(self.action_toggle_bookmark)
+        self.preview_text.bookmarkNextRequested.connect(self.action_next_bookmark)
+        self.preview_text.bookmarkPrevRequested.connect(self.action_prev_bookmark)
+        self.preview_text.foldToggleRequested.connect(self.action_toggle_fold_current)
+        self.palette.currentItemChanged.connect(self._on_palette_item_selected)
+        self.palette.itemClicked.connect(lambda _item: self._on_palette_item_selected(self.palette.currentItem(), None))
+        self.palette.itemSelectionChanged.connect(lambda: self._on_palette_item_selected(self.palette.currentItem(), None))
+        self.find_next_btn.clicked.connect(self.action_find_next)
+        self.find_prev_btn.clicked.connect(self.action_find_previous)
+        self.find_rep_btn.clicked.connect(lambda: self.action_replace(one_only=True))
+        self.find_rep_all_btn.clicked.connect(lambda: self.action_replace(one_only=False))
+        self.find_close_btn.clicked.connect(lambda: self.find_bar.setVisible(False))
+        self.find_bar_match_case.toggled.connect(self._set_find_match_case)
+        self.find_bar_whole_word.toggled.connect(self._set_find_whole_word)
+        self.find_bar_regex.toggled.connect(self._set_find_regex)
+        self.find_bar_sel_only.toggled.connect(self._set_replace_in_selection)
+        self._preview_highlighter = PythonSyntaxHighlighter(self.preview_text.document())
         self._refresh_preview()
+        self._update_editor_status()
+        self._apply_preview_lockdown()
+
+    # ── local preview API (expandable) ───────────────────────────────────────
+
+    def _start_preview_api_if_enabled(self):
+        # Local code toggle + env override.
+        # - Default follows PREVIEW_API_ENABLED.
+        # - Set PYFLAME_UI_API=1/on/true/yes to force-enable.
+        # - Set PYFLAME_UI_API=0/off/false/no to force-disable.
+        enabled = bool(PREVIEW_API_ENABLED)
+        enabled_env = os.getenv('PYFLAME_UI_API', '').strip().lower()
+        if enabled_env in {'1', 'true', 'yes', 'on'}:
+            enabled = True
+        elif enabled_env in {'0', 'false', 'no', 'off'}:
+            enabled = False
+        if not enabled:
+            return
+
+        host = os.getenv('PYFLAME_UI_API_HOST', '127.0.0.1').strip() or '127.0.0.1'
+        try:
+            port = int(os.getenv('PYFLAME_UI_API_PORT', '18791'))
+        except Exception:
+            port = 18791
+
+        app = self
+
+        class _ApiHandler(BaseHTTPRequestHandler):
+            def _send_json(self, status_code: int, payload: dict):
+                body = json.dumps(payload).encode('utf-8')
+                self.send_response(status_code)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path in ('/health', '/api/health'):
+                    self._send_json(200, {'ok': True})
+                    return
+                if self.path in ('/preview', '/api/preview'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('get_preview', None, event, box))
+                    if not event.wait(timeout=2.0):
+                        self._send_json(504, {'ok': False, 'error': 'preview request timed out'})
+                        return
+                    self._send_json(200, {'ok': True, **box})
+                    return
+                if self.path in ('/state', '/api/state'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('get_state', None, event, box))
+                    if not event.wait(timeout=2.0):
+                        self._send_json(504, {'ok': False, 'error': 'state request timed out'})
+                        return
+                    self._send_json(200, {'ok': True, **box})
+                    return
+                self._send_json(404, {'ok': False, 'error': 'not found'})
+
+            def do_POST(self):
+                try:
+                    length = int(self.headers.get('Content-Length', '0'))
+                    raw = self.rfile.read(length) if length > 0 else b'{}'
+                    payload = json.loads(raw.decode('utf-8') or '{}')
+                except Exception as e:
+                    self._send_json(400, {'ok': False, 'error': f'invalid json: {e}'})
+                    return
+
+                if self.path in ('/preview', '/api/preview'):
+                    code = payload.get('code')
+                    if not isinstance(code, str):
+                        self._send_json(400, {'ok': False, 'error': 'code must be a string'})
+                        return
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('set_preview', {'code': code}, event, box))
+                elif self.path in ('/new', '/api/new'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('new_project', payload or {}, event, box))
+                elif self.path in ('/import', '/api/import'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('import_script', payload or {}, event, box))
+                elif self.path in ('/export', '/api/export'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('export_script', payload or {}, event, box))
+                elif self.path in ('/widget/add', '/api/widget/add'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('widget_add', payload or {}, event, box))
+                elif self.path in ('/widget/move', '/api/widget/move'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('widget_move', payload or {}, event, box))
+                elif self.path in ('/widget/props', '/api/widget/props'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('widget_props', payload or {}, event, box))
+                elif self.path in ('/window/props', '/api/window/props'):
+                    event = threading.Event()
+                    box: dict = {}
+                    app._api_queue.put(('window_props', payload or {}, event, box))
+                else:
+                    self._send_json(404, {'ok': False, 'error': 'not found'})
+                    return
+
+                if not event.wait(timeout=10.0):
+                    self._send_json(504, {'ok': False, 'error': 'api request timed out'})
+                    return
+                ok = bool(box.get('ok', True) and not box.get('error'))
+                self._send_json(200 if ok else 400, {'ok': ok, **box})
+
+            def log_message(self, fmt, *args):
+                return
+
+        try:
+            self._api_server = ThreadingHTTPServer((host, port), _ApiHandler)
+        except Exception as e:
+            _bootstrap_logger.warning('Preview API failed to start on %s:%s (%s)', host, port, e)
+            return
+
+        self._api_thread = threading.Thread(target=self._api_server.serve_forever, daemon=True)
+        self._api_thread.start()
+        _bootstrap_logger.info('Preview API listening on http://%s:%s', host, port)
+
+    def _process_api_requests(self):
+        """Handle queued API actions on the Qt thread.
+
+        API HTTP handlers enqueue requests from background threads; this method
+        performs UI mutations safely on the main thread.
+        """
+        while True:
+            try:
+                action, payload, event, box = self._api_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            try:
+                if action == 'get_preview':
+                    box.update(
+                        {
+                            'code': self.preview_text.toPlainText(),
+                            'dirty': bool(self._dirty),
+                            'source': 'imported' if self._raw_import_code is not None else 'generated',
+                        }
+                    )
+                elif action == 'get_state':
+                    self._persist_active_window()
+                    box.update(
+                        {
+                            'active_window_index': self.active_window_index,
+                            'windows': [
+                                {
+                                    'function_name': w.function_name,
+                                    'grid_columns': w.grid_columns,
+                                    'grid_rows': w.grid_rows,
+                                    'window_title': getattr(w, 'window_title', None),
+                                    'parent_window': getattr(w, 'parent_window', None),
+                                    'window_margins': getattr(w, 'window_margins', 15),
+                                    'widgets': [
+                                        {
+                                            'widget_type': x.widget_type,
+                                            'var_name': x.var_name,
+                                            'row': x.row,
+                                            'col': x.col,
+                                            'row_span': x.row_span,
+                                            'col_span': x.col_span,
+                                            'properties': x.properties,
+                                            'code_error': bool(getattr(x, '_code_error', False)),
+                                        }
+                                        for x in w.widgets
+                                    ],
+                                }
+                                for w in self.windows
+                            ],
+                        }
+                    )
+                elif action == 'set_preview':
+                    code = str((payload or {}).get('code', ''))
+                    ok_protected, msg_protected = self._api_validate_protected_update(code)
+                    if not ok_protected:
+                        box.update({'ok': False, 'message': msg_protected})
+                    else:
+                        self._set_active_panel('preview')
+                        self._raw_import_code = code
+                        self._set_preview_text_programmatic(code)
+                        self._center_and_highlight_preview_api_write()
+                        self._preview_user_edited = True
+                        self._last_preview_code = code
+                        # Keep UI preview in sync for API code edits as well.
+                        self._sync_canvas_from_preview_code_best_effort()
+                        self._dirty_mark()
+                        box.update({'updated': True, 'length': len(code)})
+                elif action == 'new_project':
+                    self._new_project_no_prompt()
+                    box.update({'ok': True})
+                elif action == 'import_script':
+                    path = str((payload or {}).get('path', ''))
+                    ok, msg = self._import_script_from_path(path, interactive=False)
+                    box.update({'ok': ok, 'message': msg})
+                elif action == 'export_script':
+                    output_dir = str((payload or {}).get('output_dir', ''))
+                    overwrite = bool((payload or {}).get('overwrite', True))
+                    ok, msg = self._export_script_to_dir(output_dir, overwrite=overwrite, interactive=False, reveal=False)
+                    box.update({'ok': ok, 'message': msg})
+                elif action == 'widget_add':
+                    ok, msg = self._api_widget_add(payload or {})
+                    box.update({'ok': ok, 'message': msg})
+                elif action == 'widget_move':
+                    ok, msg = self._api_widget_move(payload or {})
+                    box.update({'ok': ok, 'message': msg})
+                elif action == 'widget_props':
+                    self._set_active_panel('props')
+                    ok, msg = self._api_widget_props(payload or {})
+                    box.update({'ok': ok, 'message': msg})
+                elif action == 'window_props':
+                    self._set_active_panel('props')
+                    ok, msg = self._api_window_props(payload or {})
+                    box.update({'ok': ok, 'message': msg})
+                else:
+                    box.update({'error': f'unknown action: {action}'})
+            except Exception as e:
+                box.update({'error': str(e)})
+            finally:
+                event.set()
+
+    def _api_find_container(self, var_name: str):
+        vn = (var_name or '').strip()
+        for c in self.canvas.containers:
+            if (c.model.var_name or '').strip() == vn:
+                return c
+        return None
+
+    def _api_apply_dirty_refresh(self):
+        self._raw_import_code = None
+        self._dirty_mark()
+        self._schedule_preview_update(center_on_change=False)
+        self._record_history_state()
+
+    def _api_validate_protected_update(self, new_code: str) -> tuple[bool, str]:
+        """Reject API code edits that modify protected Window Build blocks.
+
+        Protected regions are editor-owned UI/layout structure. Widget/layout changes
+        must go through widget/window API endpoints instead of raw code writes.
+        """
+        try:
+            ranges = self.preview_text._protected_ranges()
+        except Exception:
+            ranges = []
+        if not ranges:
+            return True, ''
+
+        old_code = self.preview_text.toPlainText()
+        for start, end in ranges:
+            if start < 0 or end < start:
+                continue
+            if end > len(old_code) or end > len(new_code):
+                return False, 'API code edit rejected: protected Window Build blocks are read-only; use /api/widget/* or /api/window/props.'
+            if old_code[start:end] != new_code[start:end]:
+                return False, 'API code edit rejected: protected Window Build blocks are read-only; use /api/widget/* or /api/window/props.'
+        return True, ''
+
+    def _api_widget_add(self, payload: dict) -> tuple[bool, str]:
+        widget_type = str(payload.get('widget_type', '')).strip()
+        if not widget_type:
+            return False, 'widget_type is required'
+
+        window_index = payload.get('window_index', None)
+        if window_index is not None:
+            try:
+                idx = max(0, min(int(window_index), len(self.windows) - 1))
+            except Exception:
+                return False, 'invalid window_index'
+            self.active_window_index = idx
+            self._sync_canvas_from_active_window()
+
+        try:
+            row = int(payload.get('row', 0))
+            col = int(payload.get('col', 0))
+        except Exception:
+            return False, 'row/col must be integers'
+
+        before = len(self.canvas.containers)
+        self.canvas._add_widget(widget_type, row, col)
+        if len(self.canvas.containers) <= before:
+            return False, 'failed to add widget (type/overlap/position)'
+
+        c = self.canvas.containers[-1]
+        if payload.get('var_name'):
+            c.model.var_name = str(payload.get('var_name'))
+            try:
+                c.replace_inner_widget(WidgetContainer.make_widget(c.model.widget_type, c.model.properties))
+            except Exception:
+                pass
+        self._persist_active_window()
+        self._api_apply_dirty_refresh()
+        return True, c.model.var_name or 'widget added'
+
+    def _api_widget_move(self, payload: dict) -> tuple[bool, str]:
+        c = self._api_find_container(str(payload.get('var_name', '')))
+        if c is None:
+            return False, 'widget not found by var_name'
+
+        m = c.model
+        try:
+            row = int(payload.get('row', m.row))
+            col = int(payload.get('col', m.col))
+            row_span = int(payload.get('row_span', m.row_span))
+            col_span = int(payload.get('col_span', m.col_span))
+        except Exception:
+            return False, 'row/col/row_span/col_span must be integers'
+
+        row_span = max(1, row_span)
+        col_span = max(1, col_span)
+        row = max(0, min(row, self.config.grid_rows - row_span))
+        col = max(0, min(col, self.config.grid_columns - col_span))
+
+        if self.canvas._has_overlap(row, col, row_span, col_span, ignore_container=c):
+            return False, 'target position overlaps another widget'
+
+        m.row, m.col, m.row_span, m.col_span = row, col, row_span, col_span
+        c.setGeometry(self.canvas.cell_rect(row, col, row_span, col_span))
+        self.canvas.widget_moved.emit(c)
+        self._persist_active_window()
+        self._api_apply_dirty_refresh()
+        return True, 'widget moved'
+
+    def _api_widget_props(self, payload: dict) -> tuple[bool, str]:
+        c = self._api_find_container(str(payload.get('var_name', '')))
+        if c is None:
+            return False, 'widget not found by var_name'
+
+        props = payload.get('properties', {})
+        if not isinstance(props, dict):
+            return False, 'properties must be an object'
+
+        c.model.properties.update(props)
+        if 'new_var_name' in payload:
+            c.model.var_name = str(payload.get('new_var_name') or c.model.var_name)
+
+        try:
+            c.replace_inner_widget(WidgetContainer.make_widget(c.model.widget_type, c.model.properties))
+        except Exception as e:
+            return False, f'failed to rebuild widget: {e}'
+
+        self._persist_active_window()
+        self._api_apply_dirty_refresh()
+        return True, 'widget properties updated'
+
+    def _api_window_props(self, payload: dict) -> tuple[bool, str]:
+        window_index = payload.get('window_index', self.active_window_index)
+        try:
+            idx = max(0, min(int(window_index), len(self.windows) - 1))
+        except Exception:
+            return False, 'invalid window_index'
+
+        self.active_window_index = idx
+        w = self.windows[idx]
+
+        if 'title' in payload:
+            w.window_title = (str(payload.get('title') or '').strip() or None)
+
+        if 'name' in payload:
+            old_name = w.function_name
+            name = re.sub(r'[^a-zA-Z0-9_]+', '_', str(payload.get('name') or '').strip()).strip('_') or w.function_name
+            if name and name[0].isdigit():
+                name = f'window_{name}'
+            w.function_name = name
+            if old_name != name:
+                for ww in self.windows:
+                    if getattr(ww, 'parent_window', None) == old_name:
+                        ww.parent_window = name
+
+        if 'parent_window' in payload:
+            p = payload.get('parent_window')
+            if p in (None, '', 'None'):
+                w.parent_window = None
+            else:
+                p = str(p)
+                w.parent_window = p if p != w.function_name else None
+
+        try:
+            new_cols = int(payload.get('cols', w.grid_columns))
+            new_rows = int(payload.get('rows', w.grid_rows))
+            new_margins = self._parse_window_margins_value(payload.get('window_margins', getattr(w, 'window_margins', 15)))
+        except Exception:
+            return False, 'cols/rows must be integers and window_margins must be 1 or 4 integers'
+        new_cols = max(1, new_cols)
+        new_rows = max(1, new_rows)
+
+        # Remove widgets outside new bounds.
+        w.widgets = [x for x in w.widgets if x.row < new_rows and x.col < new_cols]
+        for x in w.widgets:
+            x.row = max(0, min(x.row, new_rows - 1))
+            x.col = max(0, min(x.col, new_cols - 1))
+            x.row_span = max(1, min(x.row_span, new_rows - x.row))
+            x.col_span = max(1, min(x.col_span, new_cols - x.col))
+
+        w.grid_columns = new_cols
+        w.grid_rows = new_rows
+        w.window_margins = new_margins
+        self._rebuild_window_tabs()
+        self._sync_canvas_from_active_window()
+        self._persist_active_window()
+        self._api_apply_dirty_refresh()
+        return True, 'window properties updated'
+
+    def _current_window(self) -> ScriptWindow:
+        if not self.windows:
+            self.windows = [ScriptWindow(function_name='main_window', grid_columns=4, grid_rows=3, widgets=[])]
+            self.active_window_index = 0
+        self.active_window_index = max(0, min(self.active_window_index, len(self.windows) - 1))
+        return self.windows[self.active_window_index]
+
+    def _sync_canvas_from_active_window(self):
+        """Load active window model into canvas UI."""
+        w = self._current_window()
+        self.config.grid_columns = max(1, int(getattr(w, 'grid_columns', 4) or 4))
+        self.config.grid_rows = max(1, int(getattr(w, 'grid_rows', 3) or 3))
+        self.canvas.update_config(self.config)
+        self.canvas.set_window_margins(getattr(w, 'window_margins', 15))
+        self.canvas.set_window_title_override(getattr(w, 'window_title', None))
+
+        # Clear previous tab widgets from canvas (avoid stale UI when switching tabs).
+        for c in list(getattr(self.canvas, 'containers', [])):
+            try:
+                c.deleteLater()
+            except Exception:
+                pass
+        self.canvas.containers = []
+        self.canvas.selected_container = None
+
+        for model in w.widgets:
+            try:
+                widget = WidgetContainer.make_widget(model.widget_type, model.properties)
+                container = WidgetContainer(widget, model, self.canvas)
+                container.setGeometry(self.canvas.cell_rect(model.row, model.col, model.row_span, model.col_span))
+                container.set_preview_mode(self.canvas.preview_mode)
+                container.show()
+                self.canvas.containers.append(container)
+            except Exception as e:
+                print(f'Error restoring widget in tab switch: {e}')
+
+        self.canvas.update()
+        self.config_bar.load_config(self.config)
+        self._show_active_window_properties()
+        self._refresh_preview()
+
+    def _current_models(self) -> list[PlacedWidget]:
+        if not hasattr(self, 'canvas'):
+            return []
+        return [c.model for c in getattr(self.canvas, 'containers', [])]
+
+    def _persist_active_window(self):
+        if not self.windows:
+            return
+        w = self._current_window()
+        w.grid_columns = max(1, self.config.grid_columns)
+        w.grid_rows = max(1, self.config.grid_rows)
+        w.widgets = self._current_models()
+
+    def _rebuild_window_tabs(self):
+        if not hasattr(self, 'window_tabs'):
+            return
+        self.window_tabs.blockSignals(True)
+        while self.window_tabs.count() > 0:
+            self.window_tabs.removeTab(0)
+        for i, w in enumerate(self.windows):
+            label = (w.function_name or f'window_{i+1}').replace('_', ' ')
+            self.window_tabs.addTab(label)
+        if self.windows:
+            self.window_tabs.setCurrentIndex(max(0, min(self.active_window_index, len(self.windows)-1)))
+            self.window_tabs.setTabsClosable(len(self.windows) > 1)
+        can_remove = len(self.windows) > 1
+        if hasattr(self, 'window_remove_btn'):
+            self.window_remove_btn.setEnabled(can_remove)
+        self.window_tabs.blockSignals(False)
+
+    def _default_new_window_name(self) -> str:
+        count = sum(1 for w in self.windows if (w.function_name or '').startswith('main_window'))
+        return f'main_window_{count + 1}'
+
+    def action_add_window_tab(self):
+        default_name = self._default_new_window_name()
+        name, ok = QInputDialog.getText(self, 'Add Window', 'Window function name:', text=default_name)
+        if not ok:
+            return
+        fn = re.sub(r'[^a-zA-Z0-9_]+', '_', (name or '').strip()).strip('_') or default_name
+        if fn[0].isdigit():
+            fn = f'window_{fn}'
+        existing = {w.function_name for w in self.windows}
+        base = fn
+        suffix = 2
+        while fn in existing:
+            fn = f'{base}_{suffix}'
+            suffix += 1
+        self._persist_active_window()
+        self.windows.append(ScriptWindow(function_name=fn, window_title='New Window', grid_columns=4, grid_rows=3, widgets=[]))
+        self.active_window_index = len(self.windows) - 1
+        self._rebuild_window_tabs()
+        self._sync_canvas_from_active_window()
+        self._dirty_mark()
+
+    def action_remove_window_tab(self, index: int | None = None):
+        if len(self.windows) <= 1:
+            msg = QMessageBox(self)
+            msg.setWindowTitle('Cannot Remove Window')
+            msg.setText('At least one window is required. Add another window before removing this one.')
+            msg.setIcon(QMessageBox.NoIcon)
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec()
+            return
+        idx = self.active_window_index if index is None else int(index)
+        if idx < 0 or idx >= len(self.windows):
+            return
+
+        # Safety confirmation: removing a tab deletes that window from exported script.
+        label = self.windows[idx].function_name or f'window_{idx+1}'
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Delete Window?')
+        msg.setText(
+            f'You are about to delete window "{label}" from this script.\n\n'
+            'Do you want to proceed?'
+        )
+        msg.setIcon(QMessageBox.NoIcon)
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Cancel)
+        if msg.exec() != QMessageBox.Yes:
+            return
+
+        self._persist_active_window()
+        self.windows.pop(idx)
+        self.active_window_index = max(0, min(idx, len(self.windows) - 1))
+        self._rebuild_window_tabs()
+        self._sync_canvas_from_active_window()
+        self._dirty_mark()
+
+    def _rename_window_references_in_preview(self, old_name: str, new_name: str):
+        if not hasattr(self, 'preview_text'):
+            return
+        code = self.preview_text.toPlainText()
+        if not code.strip() or old_name == new_name:
+            return
+
+        old_method = f'create_{old_name}'
+        new_method = f'create_{new_name}'
+
+        # Rename method calls/defs and object references conservatively.
+        code = re.sub(rf'\b{re.escape(old_method)}\b', new_method, code)
+        code = re.sub(rf'\bself\.{re.escape(old_name)}\b', f'self.{new_name}', code)
+
+        self.preview_text.setPlainText(code)
+
+    def action_rename_window_tab(self, index: int | None = None):
+        if not self.windows:
+            return
+        idx = self.active_window_index if index is None else int(index)
+        if idx < 0 or idx >= len(self.windows):
+            return
+        current = self.windows[idx].function_name or f'window_{idx+1}'
+        name, ok = QInputDialog.getText(self, 'Rename Window', 'Window function name:', text=current)
+        if not ok:
+            return
+        fn = re.sub(r'[^a-zA-Z0-9_]+', '_', (name or '').strip()).strip('_') or current
+        if fn[0].isdigit():
+            fn = f'window_{fn}'
+        existing = {w.function_name for i, w in enumerate(self.windows) if i != idx}
+        base = fn
+        suffix = 2
+        while fn in existing:
+            fn = f'{base}_{suffix}'
+            suffix += 1
+
+        old_name = self.windows[idx].function_name
+        self.windows[idx].function_name = fn
+        if old_name and fn and old_name != fn:
+            self._rename_window_references_in_preview(old_name, fn)
+
+        self._rebuild_window_tabs()
+        self._dirty_mark()
+
+    def _on_window_tab_changed(self, index: int):
+        if index < 0 or index >= len(self.windows):
+            return
+        if index == self.active_window_index:
+            return
+        self._persist_active_window()
+        self.active_window_index = index
+        self._sync_canvas_from_active_window()
+
+    def _on_window_tab_double_clicked(self, index: int):
+        if index < 0:
+            return
+        self.action_rename_window_tab(index)
+
+    def _show_window_tab_menu(self, pos):
+        menu = QMenu(self)
+        menu.addAction('Add Window', self.action_add_window_tab)
+        menu.addAction('Rename Window', lambda: self.action_rename_window_tab(self.window_tabs.tabAt(pos)))
+        rm = menu.addAction('Remove Window', lambda: self.action_remove_window_tab(self.window_tabs.tabAt(pos)))
+        rm.setEnabled(len(self.windows) > 1)
+        menu.exec(self.window_tabs.mapToGlobal(pos))
 
     # ── signal handlers ───────────────────────────────────────────────────────
 
-    _RIGHT_MIN = 260
-    _RIGHT_MAX = 520
+    # Lock right sidebar width (Widgets + Properties) to avoid unnecessary horizontal stretching.
+    _RIGHT_MIN = 320
+    _RIGHT_MAX = 320
 
     def _clamp_right_panel(self):
         sizes = self.main_split.sizes()
@@ -3279,12 +2284,14 @@ class PyFlameBuilder(QMainWindow):
         right = max(self._RIGHT_MIN, min(self._RIGHT_MAX, sizes[2]))
         if right != sizes[2]:
             total = sum(sizes)
-            left = sizes[0]
-            center = max(300, total - left - right)
-            self.main_split.setSizes([left, center, right])
+            preview_w = sizes[0]
+            center = max(300, total - preview_w - right)
+            self.main_split.setSizes([preview_w, center, right])
 
     def _on_grid_changed(self, config):
+        self._raw_import_code = None
         self.config = config
+        self._persist_active_window()
         self.config_bar.load_config(config)
         self._dirty = True
         self._update_title()
@@ -3292,32 +2299,238 @@ class PyFlameBuilder(QMainWindow):
         self._record_history_state()
 
     def _on_config_changed(self, config):
+        self._raw_import_code = None
         self.canvas.update_config(config)
+        self._persist_active_window()
         self._dirty = True
         self._update_title()
         self._schedule_preview_update()
         self._record_history_state()
 
+    @staticmethod
+    def _parse_window_margins_value(raw) -> int | list[int]:
+        """Accept one int or four comma-separated ints for window margins."""
+        if isinstance(raw, (list, tuple)):
+            vals = [int(x) for x in raw]
+            if len(vals) == 1:
+                return max(0, vals[0])
+            if len(vals) == 4:
+                return [max(0, v) for v in vals]
+            raise ValueError('window_margins must have 1 or 4 values')
+
+        s = str(raw).strip()
+        if not s:
+            return 15
+        if ',' in s:
+            parts = [p.strip() for p in s.split(',') if p.strip()]
+            vals = [int(p) for p in parts]
+            if len(vals) == 1:
+                return max(0, vals[0])
+            if len(vals) == 4:
+                return [max(0, v) for v in vals]
+            raise ValueError('window_margins must be one value or four values (l,t,r,b)')
+        return max(0, int(s))
+
+    def _show_active_window_properties(self):
+        w = self._current_window()
+
+        def _apply_window_grid(cols: int, rows: int, window_margins):
+            new_cols = max(1, int(cols))
+            new_rows = max(1, int(rows))
+            try:
+                new_margins = self._parse_window_margins_value(window_margins)
+            except Exception:
+                self._show_active_window_properties()
+                return
+            cur_cols = int(self.config.grid_columns)
+            cur_rows = int(self.config.grid_rows)
+
+            # If shrinking grid would remove occupied rows/cols, warn first.
+            if new_rows < cur_rows or new_cols < cur_cols:
+                affected = [
+                    c for c in self.canvas.containers
+                    if c.model.row >= new_rows or c.model.col >= new_cols
+                ]
+                if affected:
+                    msg = QMessageBox(self)
+                    msg.setWindowTitle('Grid Shrink Will Delete Widgets')
+                    msg.setText(
+                        f'Reducing window size will delete {len(affected)} widget(s) '\
+                        'from removed rows/columns.\n\nContinue?'
+                    )
+                    msg.setIcon(QMessageBox.NoIcon)
+                    msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+                    msg.setDefaultButton(QMessageBox.Cancel)
+                    if msg.exec() != QMessageBox.Yes:
+                        # Repaint current values in properties panel.
+                        self._show_active_window_properties()
+                        return
+
+            # Apply shrink via delete helpers so widgets in removed rows/cols are removed.
+            if new_rows < cur_rows:
+                for r in range(cur_rows - 1, new_rows - 1, -1):
+                    self.canvas._delete_row(r, confirm=False)
+            if new_cols < cur_cols:
+                for c in range(cur_cols - 1, new_cols - 1, -1):
+                    self.canvas._delete_col(c, confirm=False)
+
+            # Apply growth directly.
+            self.config.grid_columns = max(1, new_cols)
+            self.config.grid_rows = max(1, new_rows)
+            w.grid_columns = self.config.grid_columns
+            w.grid_rows = self.config.grid_rows
+            w.window_margins = new_margins
+            self.canvas.update_config(self.config)
+            self.canvas.set_window_margins(new_margins)
+            self.config_bar.load_config(self.config)
+            self._raw_import_code = None
+            self._dirty_mark()
+            self._schedule_preview_update(center_on_change=False)
+            self._record_history_state()
+
+        def _apply_window_title(new_title: str):
+            idx = self.active_window_index
+            self.windows[idx].window_title = (new_title or '').strip() or None
+            self.canvas.set_window_title_override(self.windows[idx].window_title)
+            self._dirty_mark()
+            self._schedule_preview_update(center_on_change=False)
+            self._record_history_state()
+
+        def _apply_window_name(new_name: str):
+            idx = self.active_window_index
+            old_name = self.windows[idx].function_name
+            fn = re.sub(r'[^a-zA-Z0-9_]+', '_', (new_name or '').strip()).strip('_') or old_name or f'window_{idx+1}'
+            if fn and fn[0].isdigit():
+                fn = f'window_{fn}'
+            existing = {w.function_name for i, w in enumerate(self.windows) if i != idx}
+            base = fn
+            suffix = 2
+            while fn in existing:
+                fn = f'{base}_{suffix}'
+                suffix += 1
+            self.windows[idx].function_name = fn
+            if old_name and fn and old_name != fn:
+                # Update parent links referencing old name.
+                for ww in self.windows:
+                    if getattr(ww, 'parent_window', None) == old_name:
+                        ww.parent_window = fn
+                self._rename_window_references_in_preview(old_name, fn)
+            self._rebuild_window_tabs()
+            # Reflect final normalized/uniquified name back into the field.
+            self._show_active_window_properties()
+            self._dirty_mark()
+            self._record_history_state()
+
+        def _apply_window_parent(parent_name: str | None):
+            idx = self.active_window_index
+            cur = self.windows[idx]
+            cur.parent_window = parent_name if parent_name and parent_name != cur.function_name else None
+            self._normalize_window_parent_refs()
+            self._dirty_mark()
+            self._schedule_preview_update(center_on_change=False)
+            self._record_history_state()
+
+        if self.active_window_index > 0 and not getattr(w, 'window_title', None):
+            w.window_title = 'New Window'
+
+        parent_opts = [ww.function_name for i, ww in enumerate(self.windows) if i != self.active_window_index]
+        self.props.show_window_properties(
+            w.function_name,
+            getattr(w, 'window_title', None),
+            w.grid_columns,
+            w.grid_rows,
+            getattr(w, 'window_margins', 15),
+            _apply_window_grid,
+            _apply_window_name,
+            on_title_changed=_apply_window_title,
+            parent_window=getattr(w, 'parent_window', None),
+            parent_options=parent_opts,
+            on_parent_changed=_apply_window_parent,
+            show_parent=(self.active_window_index > 0),
+        )
+
     def _on_widget_selected(self, container):
         if container is None:
-            self.props.clear()
+            self._show_active_window_properties()
         else:
             self.props.show_properties(container)
 
+    def _on_palette_item_selected(self, current, _previous):
+        """Selecting a widget type in Widgets panel should show a matching widget's properties."""
+        if current is None:
+            return
+        try:
+            widget_type = current.data(Qt.UserRole)
+        except Exception:
+            widget_type = None
+        if not widget_type:
+            return
+
+        containers = list(getattr(self.canvas, 'containers', []) or [])
+
+        # Prefer currently selected matching widget if one is already selected.
+        selected = getattr(self.canvas, 'selected_container', None)
+        if selected is not None and getattr(getattr(selected, 'model', None), 'widget_type', None) == widget_type:
+            self.props.show_properties(selected)
+            return
+
+        # Otherwise pick the first matching widget on active canvas.
+        match = next((c for c in containers if getattr(getattr(c, 'model', None), 'widget_type', None) == widget_type), None)
+        if match is not None:
+            self.canvas.select_widget(match)
+            self.props.show_properties(match)
+            return
+
+        # No placed widget of this type yet: show default property schema preview.
+        spec = WIDGET_SPECS.get(widget_type, {})
+        defaults = {}
+        for p in spec.get('props', []):
+            if isinstance(p, PropDef):
+                defaults[p.name] = copy.deepcopy(p.default)
+
+        class _PalettePreviewContainer:
+            def __init__(self, model):
+                self.model = model
+                # properties_panel may read container.canvas for token_dest options.
+                self.canvas = None
+
+            def replace_inner_widget(self, _new_widget):
+                # Palette preview row is schema-only; no canvas widget to rebuild.
+                return
+
+        preview_model = PlacedWidget(
+            widget_type=widget_type,
+            row=0,
+            col=0,
+            row_span=1,
+            col_span=1,
+            properties=defaults,
+            var_name=to_snake(spec.get('display', widget_type)).replace('-', '_') or 'widget',
+        )
+        self.props.show_properties(_PalettePreviewContainer(preview_model))
+
     def _on_widget_moved(self, container):
+        self._raw_import_code = None
         # Refresh properties panel so grid position fields update
         if container is not None:
             self.props.show_properties(container)
+        self._persist_active_window()
         self._dirty_mark()
         self._schedule_preview_update(center_on_change=False)
         self._record_history_state()
 
     def _on_canvas_content_changed(self):
+        self._raw_import_code = None
+        self._persist_active_window()
+        if getattr(self.canvas, 'selected_container', None) is None:
+            self._show_active_window_properties()
         self._dirty_mark()
         self._schedule_preview_update(center_on_change=True)
         self._record_history_state()
 
     def _on_properties_changed(self):
+        self._raw_import_code = None
+        self._persist_active_window()
         self._dirty_mark()
         self._schedule_preview_update()
         self._record_history_state()
@@ -3349,24 +2562,39 @@ class PyFlameBuilder(QMainWindow):
             self._schedule_preview_update()
 
     def _set_preview_visible(self, visible: bool):
-        self._preview_visible = bool(visible)
+        visible = bool(visible)
+        if visible == self._preview_visible:
+            return
+
+        if not visible:
+            # Preserve current splitter layout before hiding code panel.
+            try:
+                self._main_split_sizes_before_preview_hide = list(self.main_split.sizes())
+            except Exception:
+                self._main_split_sizes_before_preview_hide = None
+
+        self._preview_visible = visible
         self.preview_panel.setVisible(self._preview_visible)
 
         if self._preview_visible:
-            self.main_split.setSizes([420, 900, 320])
+            # Re-open Code Editor at a sane default width.
+            cur = self.main_split.sizes()
+            right = cur[2] if len(cur) >= 3 else 320
+            remaining = max(700, sum(cur[:2]) if len(cur) >= 3 else 1320)
+            default_preview = 420
+            default_center = max(320, remaining - default_preview)
+            self.main_split.setSizes([default_preview, default_center, right])
             self._refresh_preview()
         else:
-            self.main_split.setSizes([0, 1320, 320])
+            cur = self.main_split.sizes()
+            right = cur[2] if len(cur) >= 3 else 320
+            center = sum(cur[:2]) if len(cur) >= 3 else 1320
+            self.main_split.setSizes([0, center, right])
 
         if hasattr(self, 'toggle_preview_action'):
             self.toggle_preview_action.blockSignals(True)
             self.toggle_preview_action.setChecked(self._preview_visible)
             self.toggle_preview_action.blockSignals(False)
-
-    def _copy_preview(self):
-        QApplication.clipboard().setText(self.preview_text.toPlainText())
-        self.preview_copy_btn.setText('Copied!')
-        QTimer.singleShot(900, lambda: self.preview_copy_btn.setText('Copy'))
 
     def action_zoom_in(self):
         self.canvas.zoom_in()
@@ -3387,13 +2615,90 @@ class PyFlameBuilder(QMainWindow):
         fit_h = max(0.5, (vp.height() - 24) / base_h)
         self.canvas.set_zoom(min(2.0, fit_w, fit_h))
 
+    def action_reset_layout(self):
+        """Reset splitters/panels/layout to app defaults and persist them."""
+        try:
+            self.showNormal()
+        except Exception:
+            pass
+        self.resize(1400, 800)
+        self.main_split.setSizes([420, 900, 320])
+        if hasattr(self, 'right_split'):
+            self.right_split.setSizes([344, 496])
+        self._set_preview_visible(True)
+        self._set_active_panel(None)
+        self._save_window_layout_settings()
+
+    def _update_mode_toggle_button_styles(self):
+        blue = 'rgb(0, 110, 175)'
+        off_bg = '#2d2d2d'
+        off_border = '#3a3a3a'
+        on_style = f'background: {blue}; border: 1px solid {blue}; color: #ffffff; padding: 0 8px;'
+        off_style = f'background: {off_bg}; border: 1px solid {off_border}; color: #c8c8c8; padding: 0 8px;'
+
+        self.grid_toggle_btn.setStyleSheet(on_style if self.canvas.grid_visible else off_style)
+        self.preview_mode_btn.setStyleSheet(on_style if self.canvas.preview_mode else off_style)
+
+        # Keep UI-area highlight state in sync with preview mode behavior.
+        self._set_aux_panel_highlight(self._active_aux_panel)
+
     def action_toggle_grid_visibility(self):
+        if self.canvas.preview_mode:
+            return
         self.canvas.grid_visible = not self.canvas.grid_visible
         self.grid_toggle_btn.setText('Grid: On' if self.canvas.grid_visible else 'Grid: Off')
+        self._update_mode_toggle_button_styles()
         self.canvas.update()
 
+    def _apply_preview_lockdown(self):
+        """When Preview is ON, lock non-UI-preview editing surfaces."""
+        locked = bool(self.canvas.preview_mode)
+        # Keep the actual UI preview canvas + Preview button usable.
+        self.preview_panel.setEnabled(not locked)
+        self.palette_panel.setEnabled(not locked)
+        self.props_frame.setEnabled(not locked)
+        self.window_tab_row.setEnabled(not locked)
+        self.config_bar.setEnabled(not locked)
+        self.grid_toggle_btn.setEnabled(not locked)
+
+        # Window/tab editing actions should be locked in preview mode.
+        for act_name in (
+            'add_window_action', 'rename_window_action', 'remove_window_action',
+            'undo_action', 'redo_action',
+        ):
+            act = getattr(self, act_name, None)
+            if act is not None:
+                act.setEnabled(not locked)
+
+    def action_toggle_preview_mode(self):
+        turning_on = not self.canvas.preview_mode
+        self.canvas.set_preview_mode(turning_on)
+        self.preview_mode_btn.setText('Preview: On' if self.canvas.preview_mode else 'Preview: Off')
+
+        # Grid behavior in preview mode:
+        # - entering preview: temporarily force grid off (remember prior state)
+        # - leaving preview: restore prior grid-on state
+        if turning_on:
+            self._grid_was_on_before_preview = bool(self.canvas.grid_visible)
+            if self.canvas.grid_visible:
+                self.canvas.grid_visible = False
+                self.grid_toggle_btn.setText('Grid: Off')
+                self.canvas.update()
+        else:
+            if self._grid_was_on_before_preview:
+                self.canvas.grid_visible = True
+                self.grid_toggle_btn.setText('Grid: On')
+                self.canvas.update()
+            self._grid_was_on_before_preview = False
+
+        self._apply_preview_lockdown()
+        if self.canvas.preview_mode:
+            self._show_active_window_properties()
+        self._update_mode_toggle_button_styles()
+
     def action_open_help(self, initial_file: str | None = None):
-        dlg = HelpDialog(self, initial_file=initial_file)
+        help_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'docs', 'help')
+        dlg = HelpDialog(help_dir=help_dir, stylesheet=_app_stylesheet(), parent=self, initial_file=initial_file)
         dlg.exec()
 
     def action_about(self):
@@ -3419,13 +2724,545 @@ class PyFlameBuilder(QMainWindow):
     def _preview_style(self, framed: bool = False) -> str:
         border = '2px solid #5aa9ff' if framed else '1px solid #3a3a3a'
         return (
-            f'background: #1a1a1a; color: #c8c8c8; border: {border};'
+            f'background: #282c34; color: #abb2bf; border: {border};'
             ' font-family: "Courier New", monospace; font-size: 12px;'
+            ' selection-background-color: #3e4451; selection-color: #e6e6e6;'
         )
 
     def _flash_preview_frame(self):
         self.preview_text.setStyleSheet(self._preview_style(framed=True))
         QTimer.singleShot(700, lambda: self.preview_text.setStyleSheet(self._preview_style()))
+
+    def _on_preview_text_changed(self):
+        if not self._suppress_preview_text_signal:
+            self._preview_user_edited = True
+            if self._api_preview_highlight_active:
+                self.preview_text.setExtraSelections([])
+                self._api_preview_highlight_active = False
+            # Best-effort live reflection from code editor -> UI preview.
+            self._code_to_ui_sync_timer.start()
+        self._update_editor_status()
+
+    def _set_preview_text_programmatic(self, code: str):
+        self._suppress_preview_text_signal = True
+        try:
+            self.preview_text.setPlainText(code)
+        finally:
+            self._suppress_preview_text_signal = False
+
+    def _sync_canvas_from_preview_code_best_effort(self):
+        """Best-effort code->UI sync from Code Editor assignments.
+
+        - Applies parsed kwargs for matching `self.<var> = <WidgetType>(...)` assignments.
+        - If a widget assignment/args are invalid for live preview rebuild, show
+          `[<WidgetType> CODE ERROR]` in that widget slot until code is fixed.
+        """
+        def _attr_to_str(node):
+            parts = []
+            cur = node
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                parts.append(cur.id)
+                return '.'.join(reversed(parts))
+            return None
+
+        def _value_to_prop(node):
+            if isinstance(node, ast.Constant):
+                return node.value
+            if isinstance(node, (ast.List, ast.Tuple)):
+                return [
+                    _value_to_prop(x)
+                    for x in node.elts
+                ]
+            if isinstance(node, ast.Attribute):
+                v = _attr_to_str(node)
+                # Enum-like values (Color.BLUE -> 'BLUE')
+                if v and '.' in v:
+                    return v.split('.')[-1]
+                return v
+            if isinstance(node, ast.Name):
+                if node.id in {'True', 'False'}:
+                    return node.id == 'True'
+                if node.id == 'None':
+                    return None
+                raise ValueError('unsupported expression')
+            raise ValueError('unsupported expression')
+
+        def _set_error_outline(container, enabled: bool):
+            try:
+                if enabled:
+                    container.setStyleSheet('background: transparent; border: 1px solid #a83a3a;')
+                else:
+                    container.setStyleSheet('background: transparent; border: none;')
+            except Exception:
+                pass
+
+        def _show_code_error_placeholder(container):
+            try:
+                wt = getattr(getattr(container, 'model', None), 'widget_type', 'Widget')
+                err = QLabel(f'⚠  {wt}\nCODE ERROR')
+                err.setAlignment(Qt.AlignCenter)
+                err.setStyleSheet('background:#3a1f1f; color:#ff8a8a; border:1px solid #6b2f2f;')
+                container.replace_inner_widget(err)
+                mdl = getattr(container, 'model', None)
+                if mdl is not None:
+                    setattr(mdl, '_code_error', True)
+                # Only show red outline when Properties is currently focused on this widget.
+                _set_error_outline(container, getattr(self.props, 'container', None) is container)
+            except Exception:
+                pass
+
+        code = self.preview_text.toPlainText()
+        syntax_error_vars: set[str] = set()
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            tree = None
+            # Targeted fallback: inspect each `self.<var> = ...` call block
+            # independently so errors map to the correct widget while typing.
+            lines = code.splitlines()
+            assign_start_re = re.compile(r"\bself\.([A-Za-z_][A-Za-z0-9_]*)\s*=")
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+                m = assign_start_re.search(line)
+                if not m:
+                    i += 1
+                    continue
+                var = m.group(1)
+
+                # Collect likely constructor block until parentheses balance.
+                # Supports both styles:
+                #   self.label_01 = PyFlameLabel(...)
+                #   self.label_01 =\n                #       PyFlameLabel(...)
+                block_lines = []
+                depth = 0
+                found_open = False
+                j = i
+                max_lookahead = min(len(lines), i + 40)
+                while j < max_lookahead:
+                    ln = lines[j]
+                    block_lines.append(ln)
+                    for ch in ln:
+                        if ch == '(':
+                            depth += 1
+                            found_open = True
+                        elif ch == ')':
+                            depth -= 1
+                    if found_open and depth <= 0:
+                        break
+                    j += 1
+
+                block = '\n'.join(block_lines)
+                # Ignore non-widget assignments during syntax fallback.
+                if 'PyFlame' not in block:
+                    i = max(i + 1, j + 1)
+                    continue
+                if block.strip():
+                    try:
+                        ast.parse(textwrap.dedent(block))
+                    except Exception:
+                        syntax_error_vars.add(var)
+
+                i = max(i + 1, j + 1)
+
+        if tree is None:
+            updated = False
+            if syntax_error_vars:
+                for c in list(getattr(self.canvas, 'containers', []) or []):
+                    mdl = getattr(c, 'model', None)
+                    if mdl is None:
+                        continue
+                    var = (getattr(mdl, 'var_name', '') or '').strip()
+                    if var in syntax_error_vars:
+                        _show_code_error_placeholder(c)
+                        updated = True
+            if updated:
+                self.canvas.update()
+                self._persist_active_window()
+                selected = getattr(self.canvas, 'selected_container', None)
+                if selected is not None:
+                    self.props.show_properties(selected)
+                else:
+                    self._show_active_window_properties()
+            return
+
+        # Clear stale code-error placeholders when widget code is valid again.
+        for c in list(getattr(self.canvas, 'containers', []) or []):
+            mdl = getattr(c, 'model', None)
+            if mdl is not None and getattr(mdl, '_code_error', False):
+                setattr(mdl, '_code_error', False)
+                try:
+                    c.replace_inner_widget(WidgetContainer.make_widget(mdl.widget_type, mdl.properties))
+                    _set_error_outline(c, False)
+                except Exception:
+                    _show_code_error_placeholder(c)
+
+        def _to_int(node, default=None):
+            try:
+                v = _value_to_prop(node)
+                return int(v)
+            except Exception:
+                return default
+
+        assigns: dict[str, tuple[str, dict, bool]] = {}
+        # var -> (widget_type, parsed_props, has_parse_error)
+        placements: dict[str, tuple[int, int, int, int]] = {}
+        # var -> (row, col, row_span, col_span)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                tgt = node.targets[0]
+                if not (isinstance(tgt, ast.Attribute) and isinstance(tgt.value, ast.Name) and tgt.value.id == 'self'):
+                    continue
+                var_name = tgt.attr
+                call = node.value
+                if not isinstance(call, ast.Call):
+                    continue
+                if isinstance(call.func, ast.Name):
+                    widget_type = call.func.id
+                elif isinstance(call.func, ast.Attribute):
+                    widget_type = call.func.attr
+                else:
+                    continue
+                if not widget_type.startswith('PyFlame'):
+                    continue
+
+                props = {}
+                has_error = False
+                for kw in call.keywords:
+                    if kw.arg is None:
+                        continue
+                    try:
+                        props[kw.arg] = _value_to_prop(kw.value)
+                    except Exception:
+                        has_error = True
+                assigns[var_name] = (widget_type, props, has_error)
+                continue
+
+            if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+                continue
+            call = node.value
+            func = call.func
+            if not (isinstance(func, ast.Attribute) and func.attr == 'addWidget'):
+                continue
+            args = list(getattr(call, 'args', []) or [])
+            if len(args) < 3:
+                continue
+            warg = args[0]
+            if not (isinstance(warg, ast.Attribute) and isinstance(warg.value, ast.Name) and warg.value.id == 'self'):
+                continue
+            var_name = warg.attr
+            row = _to_int(args[1], None)
+            col = _to_int(args[2], None)
+            if row is None or col is None:
+                continue
+            row_span = _to_int(args[3], 1) if len(args) > 3 else 1
+            col_span = _to_int(args[4], 1) if len(args) > 4 else 1
+            if row_span is None:
+                row_span = 1
+            if col_span is None:
+                col_span = 1
+            placements[var_name] = (max(0, row), max(0, col), max(1, row_span), max(1, col_span))
+
+        updated = False
+
+        # Remove widgets only when the code is clearly using self.<var> widget style
+        # for current canvas vars; avoid destructive false positives with local vars.
+        existing_vars = [
+            (getattr(getattr(c, 'model', None), 'var_name', '') or '').strip()
+            for c in list(getattr(self.canvas, 'containers', []) or [])
+        ]
+        self_style_detected = any(v and (f'self.{v}' in code) for v in existing_vars)
+        if assigns and self_style_detected:
+            for c in list(getattr(self.canvas, 'containers', []) or []):
+                mdl = getattr(c, 'model', None)
+                if mdl is None:
+                    continue
+                var = (getattr(mdl, 'var_name', '') or '').strip()
+                if not var:
+                    continue
+                if var in assigns and var in placements:
+                    continue
+                if var in placements:
+                    # addWidget line still present but assignment is broken/unrecognised —
+                    # keep the slot visible as a placeholder rather than silently removing.
+                    _show_code_error_placeholder(c)
+                    updated = True
+                    continue
+                try:
+                    if getattr(self.canvas, 'selected_container', None) is c:
+                        self.canvas.select_widget(None)
+                    self.canvas.containers.remove(c)
+                except Exception:
+                    pass
+                try:
+                    c.deleteLater()
+                except Exception:
+                    pass
+                updated = True
+
+        existing_by_var = {}
+        for c in list(getattr(self.canvas, 'containers', []) or []):
+            mdl = getattr(c, 'model', None)
+            if mdl is None:
+                continue
+            var = (getattr(mdl, 'var_name', '') or '').strip()
+            if var:
+                existing_by_var[var] = c
+
+        for var, c in list(existing_by_var.items()):
+            if var not in assigns:
+                continue
+            mdl = getattr(c, 'model', None)
+            if mdl is None:
+                continue
+            widget_type, props, has_error = assigns[var]
+
+            if has_error:
+                _show_code_error_placeholder(c)
+                updated = True
+                continue
+
+            # Apply parsed properties and attempt live rebuild.
+            new_props = dict(getattr(mdl, 'properties', {}) or {})
+            new_props.update(props)
+            mdl.properties = new_props
+            if widget_type != getattr(mdl, 'widget_type', None):
+                mdl.widget_type = widget_type
+
+            if var in placements:
+                row, col, row_span, col_span = placements[var]
+                max_rows = max(1, int(getattr(self.config, 'grid_rows', 1) or 1))
+                max_cols = max(1, int(getattr(self.config, 'grid_columns', 1) or 1))
+                row = max(0, min(row, max_rows - 1))
+                col = max(0, min(col, max_cols - 1))
+                row_span = max(1, min(row_span, max_rows - row))
+                col_span = max(1, min(col_span, max_cols - col))
+
+                # Prevent API/code sync from stacking widgets on top of others.
+                if not self.canvas._has_overlap(row, col, row_span, col_span, ignore_container=c):
+                    mdl.row = row
+                    mdl.col = col
+                    mdl.row_span = row_span
+                    mdl.col_span = col_span
+                    try:
+                        c.setGeometry(self.canvas.cell_rect(mdl.row, mdl.col, mdl.row_span, mdl.col_span))
+                    except Exception:
+                        pass
+
+            try:
+                new_widget = WidgetContainer.make_widget(mdl.widget_type, mdl.properties)
+                # Widget factory may silently fall back on invalid args; convert that
+                # path into an explicit CODE ERROR placeholder for clarity.
+                c.replace_inner_widget(new_widget)
+                setattr(mdl, '_code_error', False)
+                _set_error_outline(c, False)
+            except Exception:
+                _show_code_error_placeholder(c)
+            updated = True
+
+        # Add newly introduced self.<var> widgets from code that don't exist on canvas yet.
+        for var, (widget_type, props, has_error) in assigns.items():
+            if var in existing_by_var:
+                continue
+            if var not in placements:
+                continue
+
+            row, col, row_span, col_span = placements[var]
+            max_rows = max(1, int(getattr(self.config, 'grid_rows', 1) or 1))
+            max_cols = max(1, int(getattr(self.config, 'grid_columns', 1) or 1))
+            row = max(0, min(row, max_rows - 1))
+            col = max(0, min(col, max_cols - 1))
+            row_span = max(1, min(row_span, max_rows - row))
+            col_span = max(1, min(col_span, max_cols - col))
+            # Never create overlapping widgets through API/code sync.
+            if self.canvas._has_overlap(row, col, row_span, col_span):
+                continue
+
+            model = PlacedWidget(
+                widget_type=widget_type,
+                row=row,
+                col=col,
+                row_span=row_span,
+                col_span=col_span,
+                properties=dict(props or {}),
+                var_name=var,
+            )
+            try:
+                widget = WidgetContainer.make_widget(model.widget_type, model.properties)
+                container = WidgetContainer(widget, model, self.canvas)
+                container.setGeometry(self.canvas.cell_rect(model.row, model.col, model.row_span, model.col_span))
+                if hasattr(container, 'set_preview_mode'):
+                    container.set_preview_mode(getattr(self.canvas, 'preview_mode', False))
+                container.show()
+                self.canvas.containers.append(container)
+                if has_error:
+                    _show_code_error_placeholder(container)
+                updated = True
+            except Exception:
+                # If build fails, still show explicit code error placeholder.
+                try:
+                    fallback = QLabel(f'⚠  {widget_type}\nCODE ERROR')
+                    fallback.setAlignment(Qt.AlignCenter)
+                    fallback.setStyleSheet('background:#3a1f1f; color:#ff8a8a; border:1px solid #6b2f2f;')
+                    container = WidgetContainer(fallback, model, self.canvas)
+                    container.setGeometry(self.canvas.cell_rect(model.row, model.col, model.row_span, model.col_span))
+                    container.show()
+                    self.canvas.containers.append(container)
+                    setattr(model, '_code_error', True)
+                    updated = True
+                except Exception:
+                    pass
+
+        if updated:
+            self.canvas.update()
+            self._persist_active_window()
+            selected = getattr(self.canvas, 'selected_container', None)
+            if selected is not None:
+                self.props.show_properties(selected)
+            else:
+                # If selected widget was removed from code, fall back to window props.
+                self._show_active_window_properties()
+
+    def _center_and_highlight_preview_api_write(self):
+        """Center API-written preview text and highlight it in PyFlame blue."""
+        text = self.preview_text.toPlainText()
+        if not text:
+            self.preview_text.setExtraSelections([])
+            self._api_preview_highlight_active = False
+            return
+
+        lines = text.count('\n') + 1
+        mid_line = max(1, lines // 2)
+        cursor = self.preview_text.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        for _ in range(mid_line - 1):
+            if not cursor.movePosition(QTextCursor.Down):
+                break
+        self.preview_text.setTextCursor(cursor)
+        self.preview_text.centerCursor()
+
+        # Highlight whole inserted text block with translucent PyFlame blue.
+        full = self.preview_text.textCursor()
+        full.select(QTextCursor.Document)
+        sel = QTextEdit.ExtraSelection()
+        sel.cursor = full
+        sel.format.setBackground(QColor(0, 110, 175, 70))
+        self.preview_text.setExtraSelections([sel])
+        self._api_preview_highlight_active = True
+
+    def _set_work_panel_highlight(self, panel: str | None):
+        """Highlight active work panel (preview/properties) with 1px PyFlame blue border.
+
+        Use object-name scoped selectors so only panel frames are outlined (not
+        child widgets/controls inside those panels).
+        """
+        self._active_work_panel = panel
+        blue_border = '1px solid rgb(0, 110, 175)'
+        off_border = '1px solid transparent'
+        self.preview_panel.setStyleSheet(
+            f'#CodePreviewPanelFrame {{ border: {blue_border if panel == "preview" else off_border}; padding: 0px; }}'
+        )
+        self.props_frame.setStyleSheet(
+            f'#PropertiesPanelFrame {{ border: {blue_border if panel == "props" else off_border}; padding: 0px; }}'
+        )
+
+    def _set_aux_panel_highlight(self, panel: str | None):
+        """Highlight widget palette or UI canvas area with panel/mode-aware borders."""
+        self._active_aux_panel = panel
+        blue_border = '1px solid rgb(0, 110, 175)'
+        off_border = '1px solid transparent'
+        preview_border = '1px solid rgb(0, 180, 170)'
+        self.palette_panel.setStyleSheet(
+            f'#WidgetPalettePanelFrame {{ border: {blue_border if panel == "widgets" else off_border}; padding: 0px; }}'
+        )
+        if panel == 'ui':
+            border = preview_border if self.canvas.preview_mode else blue_border
+            self.canvas_scroll.setStyleSheet(f'QScrollArea {{ border: {border}; }}')
+        else:
+            self.canvas_scroll.setStyleSheet('QScrollArea { border: none; }')
+
+    def _set_active_panel(self, panel: str | None):
+        """Enforce single-active blue outline across all major panels."""
+        if panel == 'preview':
+            self._set_work_panel_highlight('preview')
+            self._set_aux_panel_highlight(None)
+        elif panel == 'props':
+            self._set_work_panel_highlight('props')
+            self._set_aux_panel_highlight(None)
+        elif panel == 'widgets':
+            self._set_work_panel_highlight(None)
+            self._set_aux_panel_highlight('widgets')
+        elif panel == 'ui':
+            self._set_work_panel_highlight(None)
+            self._set_aux_panel_highlight('ui')
+        else:
+            self._set_work_panel_highlight(None)
+            self._set_aux_panel_highlight(None)
+
+    @staticmethod
+    def _is_descendant_widget(widget, ancestor) -> bool:
+        w = widget
+        while w is not None:
+            if w is ancestor:
+                return True
+            w = w.parentWidget() if hasattr(w, 'parentWidget') else None
+        return False
+
+    def _is_ui_area_widget(self, widget) -> bool:
+        """Treat canvas + tab/zoom controls as one UI interaction area."""
+        if widget is None:
+            return False
+        return (
+            self._is_descendant_widget(widget, self.canvas_scroll)
+            or self._is_descendant_widget(widget, self.window_tab_row)
+            or self._is_descendant_widget(widget, self.zoom_bar)
+            or self._is_descendant_widget(widget, self.center_pane)
+        )
+
+    def eventFilter(self, obj, event):
+        # Selection policy:
+        # - Deselect only when clicking in the Flame preview region itself
+        #   (empty canvas or its surrounding scroll viewport area).
+        # - Never deselect from clicks in other UI panels (properties, code preview, menus).
+        if event.type() in (QEvent.MouseButtonPress, QEvent.FocusIn):
+            try:
+                hovered = QApplication.widgetAt(QCursor.pos())
+                in_props = (
+                    self._is_descendant_widget(obj, self.props)
+                    or self._is_descendant_widget(obj, self.props_frame)
+                    or self._is_descendant_widget(hovered, self.props)
+                    or self._is_descendant_widget(hovered, self.props_frame)
+                    or bool(getattr(self.props, 'underMouse', lambda: False)())
+                    or bool(getattr(self.props_frame, 'underMouse', lambda: False)())
+                )
+                in_preview = (
+                    self._is_descendant_widget(obj, self.preview_panel)
+                    or self._is_descendant_widget(hovered, self.preview_panel)
+                    or bool(getattr(self.preview_panel, 'underMouse', lambda: False)())
+                )
+                in_widgets = self._is_descendant_widget(obj, self.palette_panel) or self._is_descendant_widget(hovered, self.palette_panel)
+                in_ui = self._is_ui_area_widget(obj) or self._is_ui_area_widget(hovered)
+
+                if in_props:
+                    self._set_active_panel('props')
+                elif in_preview:
+                    self._set_active_panel('preview')
+                elif in_widgets:
+                    self._set_active_panel('widgets')
+                elif in_ui:
+                    self._set_active_panel('ui')
+
+                if event.type() == QEvent.MouseButtonPress and getattr(self.canvas, 'selected_container', None) is not None:
+                    in_canvas_scroll = self._is_descendant_widget(obj, self.canvas_scroll) or self._is_descendant_widget(hovered, self.canvas_scroll)
+                    in_canvas = self._is_descendant_widget(obj, self.canvas) or self._is_descendant_widget(hovered, self.canvas)
+                    if in_canvas_scroll and not in_canvas:
+                        self.canvas.select_widget(None)
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
 
     def _first_changed_line(self, old: str, new: str) -> int:
         old_lines = old.splitlines()
@@ -3464,12 +3301,76 @@ class PyFlameBuilder(QMainWindow):
         self.preview_text.setExtraSelections([sel])
         QTimer.singleShot(900, lambda: self.preview_text.setExtraSelections([]))
 
+    @staticmethod
+    def _protected_window_build_ranges(text: str):
+        ranges = []
+        for m in re.finditer(
+            r"#\s*-{10,}.*?\[Start Window Build\].*?\[End Window Build\].*?#\s*-{10,}",
+            text,
+            re.DOTALL,
+        ):
+            ranges.append((m.start(), m.end()))
+        return ranges
+
+    @staticmethod
+    def _merge_generated_protected_sections(current_text: str, generated_text: str) -> str | None:
+        """Keep user-editable code, replace only protected Window Build blocks from generated code.
+
+        Returns merged text when both versions contain matching protected block counts,
+        otherwise None to signal fallback behavior.
+        """
+        def _ranges(text: str):
+            return PyFlameBuilder._protected_window_build_ranges(text)
+
+        cur = _ranges(current_text)
+        gen = _ranges(generated_text)
+        if not cur or not gen or len(cur) != len(gen):
+            return None
+
+        out = []
+        cursor = 0
+        for (cs, ce), (gs, ge) in zip(cur, gen):
+            out.append(current_text[cursor:cs])
+            out.append(generated_text[gs:ge])
+            cursor = ce
+        out.append(current_text[cursor:])
+        return ''.join(out)
+
     def _refresh_preview(self):
-        models = [c.model for c in self.canvas.containers]
-        try:
-            code = CodeGenerator.generate(self.config, models, tab_order=None)
-        except Exception as e:
-            code = f'# Preview generation error\n# {e}'
+        self._persist_active_window()
+        if self._raw_import_code is not None:
+            code = self._raw_import_code
+        else:
+            models = [c.model for c in self.canvas.containers]
+            try:
+                code = CodeGenerator.generate(self.config, models, tab_order=None, windows=self.windows)
+            except Exception as e:
+                code = f'# Preview generation error\n# {e}'
+
+            current_text = self.preview_text.toPlainText() if hasattr(self, 'preview_text') else ''
+            if self._preview_auto and self._preview_user_edited and current_text and current_text != self._generated_code_snapshot:
+                merged = self._merge_generated_protected_sections(current_text, code)
+                if merged is not None:
+                    # User logic edits stay intact; only builder-owned UI blocks update.
+                    code = merged
+                else:
+                    msg = QMessageBox(self)
+                    msg.setWindowTitle('Manual Edits Detected')
+                    msg.setText('Auto Update Code wants to regenerate, but manual edits would be overwritten.')
+                    keep_btn = msg.addButton('Keep My Edits', QMessageBox.AcceptRole)
+                    overwrite_btn = msg.addButton('Overwrite with Generated', QMessageBox.DestructiveRole)
+                    pause_btn = msg.addButton('Disable Auto Update', QMessageBox.RejectRole)
+                    msg.exec()
+                    clicked = msg.clickedButton()
+                    if clicked is keep_btn:
+                        self._generated_code_snapshot = code
+                        self._update_editor_status()
+                        return
+                    if clicked is pause_btn:
+                        self.preview_auto_check.setChecked(False)
+                        self._generated_code_snapshot = code
+                        self._update_editor_status()
+                        return
 
         changed = code != self._last_preview_code
         changed_line = self._first_changed_line(self._last_preview_code, code)
@@ -3480,7 +3381,12 @@ class PyFlameBuilder(QMainWindow):
         prev_v = vbar.value()
         prev_h = hbar.value()
 
-        self.preview_text.setPlainText(code)
+        if self._api_preview_highlight_active:
+            self.preview_text.setExtraSelections([])
+            self._api_preview_highlight_active = False
+        self._set_preview_text_programmatic(code)
+        if self._raw_import_code is None:
+            self._preview_user_edited = False
         if changed and self._preview_center_on_change:
             self._scroll_preview_to_line(changed_line)
             self._flash_preview_line(changed_line)
@@ -3492,10 +3398,12 @@ class PyFlameBuilder(QMainWindow):
             QTimer.singleShot(0, lambda: self.preview_text.horizontalScrollBar().setValue(prev_h))
 
         self._last_preview_code = code
+        self._generated_code_snapshot = code
         self._preview_center_on_change = True
 
         if added_code:
             self._flash_preview_frame()
+        self._update_editor_status()
 
     # ── undo / redo history ──────────────────────────────────────────────────
 
@@ -3536,7 +3444,7 @@ class PyFlameBuilder(QMainWindow):
                 script_version=cfg.get('script_version', 'v1.0.0'),
                 flame_version=cfg.get('flame_version', '2025.1'),
                 hook_types=cfg.get('hook_types', ['get_batch_custom_ui_actions']),
-                license_type=cfg.get('license_type', 'GPL-3.0'),
+                license_type=cfg.get('license_type', 'None'),
                 grid_columns=cfg.get('grid_columns', 4),
                 grid_rows=cfg.get('grid_rows', 3),
                 column_width=cfg.get('column_width', 150),
@@ -3566,12 +3474,13 @@ class PyFlameBuilder(QMainWindow):
                     widget = WidgetContainer.make_widget(model.widget_type, model.properties)
                     container = WidgetContainer(widget, model, self.canvas)
                     container.setGeometry(self.canvas.cell_rect(model.row, model.col, model.row_span, model.col_span))
+                    container.set_preview_mode(self.canvas.preview_mode)
                     container.show()
                     self.canvas.containers.append(container)
                 except Exception as e:
                     print(f'Error restoring widget: {e}')
 
-            self.props.clear()
+            self._show_active_window_properties()
             self._refresh_preview()
             self._dirty_mark()
         finally:
@@ -3656,6 +3565,551 @@ class PyFlameBuilder(QMainWindow):
         self._apply_snapshot_state(self._history[self._history_index])
         self._update_undo_redo_actions()
 
+    def _transform_preview_selection(self, mode: str):
+        if not hasattr(self, 'preview_text'):
+            return
+
+        cursor = self.preview_text.textCursor()
+        if cursor is None:
+            return
+
+        sel_start = min(cursor.selectionStart(), cursor.selectionEnd())
+        sel_end = max(cursor.selectionStart(), cursor.selectionEnd())
+
+        if sel_start == sel_end:
+            cursor.movePosition(QTextCursor.StartOfLine)
+            cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
+        else:
+            cursor.setPosition(sel_start)
+            cursor.movePosition(QTextCursor.StartOfLine)
+            line_start = cursor.position()
+
+            end_cursor = self.preview_text.textCursor()
+            end_cursor.setPosition(sel_end)
+            if end_cursor.atBlockStart() and sel_end > sel_start:
+                end_cursor.movePosition(QTextCursor.PreviousBlock)
+            end_cursor.movePosition(QTextCursor.EndOfBlock)
+            line_end = end_cursor.position()
+
+            cursor.setPosition(line_start)
+            cursor.setPosition(line_end, QTextCursor.KeepAnchor)
+
+        selected = cursor.selectedText()
+        if not selected:
+            return
+
+        lines = selected.split('\u2029')
+
+        if mode == 'comment':
+            out_lines = [f'# {line}' if line.strip() else line for line in lines]
+        elif mode == 'uncomment':
+            out_lines = [re.sub(r'^\s*#\s?', '', line, count=1) if line.strip() else line for line in lines]
+        else:  # toggle
+            non_empty = [ln for ln in lines if ln.strip()]
+            all_commented = bool(non_empty) and all(re.match(r'^\s*#', ln) for ln in non_empty)
+            if all_commented:
+                out_lines = [re.sub(r'^\s*#\s?', '', line, count=1) if line.strip() else line for line in lines]
+            else:
+                out_lines = [f'# {line}' if line.strip() else line for line in lines]
+
+        cursor.beginEditBlock()
+        cursor.insertText('\n'.join(out_lines))
+        cursor.endEditBlock()
+        self._dirty_mark()
+
+    def action_comment_selection(self):
+        self._transform_preview_selection('comment')
+
+    def action_uncomment_selection(self):
+        self._transform_preview_selection('uncomment')
+
+    def action_toggle_comment_selection(self):
+        self._transform_preview_selection('toggle')
+
+    def _set_find_match_case(self, enabled: bool):
+        self._find_match_case = bool(enabled)
+        if hasattr(self, 'find_match_case_action'):
+            self.find_match_case_action.setChecked(self._find_match_case)
+        if hasattr(self, 'find_bar_match_case'):
+            self.find_bar_match_case.setChecked(self._find_match_case)
+
+    def _set_find_whole_word(self, enabled: bool):
+        self._find_whole_word = bool(enabled)
+        if hasattr(self, 'find_whole_word_action'):
+            self.find_whole_word_action.setChecked(self._find_whole_word)
+        if hasattr(self, 'find_bar_whole_word'):
+            self.find_bar_whole_word.setChecked(self._find_whole_word)
+
+    def _set_find_regex(self, enabled: bool):
+        self._find_regex = bool(enabled)
+        if hasattr(self, 'find_regex_action'):
+            self.find_regex_action.setChecked(self._find_regex)
+        if hasattr(self, 'find_bar_regex'):
+            self.find_bar_regex.setChecked(self._find_regex)
+
+    def _set_replace_in_selection(self, enabled: bool):
+        self._replace_in_selection = bool(enabled)
+        if hasattr(self, 'replace_in_selection_action'):
+            self.replace_in_selection_action.setChecked(self._replace_in_selection)
+        if hasattr(self, 'find_bar_sel_only'):
+            self.find_bar_sel_only.setChecked(self._replace_in_selection)
+
+    def _remember_search(self, text: str):
+        text = (text or '').strip()
+        if not text:
+            return
+        if text in self._recent_searches:
+            self._recent_searches.remove(text)
+        self._recent_searches.insert(0, text)
+        self._recent_searches = self._recent_searches[:10]
+        if hasattr(self, 'find_input'):
+            self.find_input.clear()
+            self.find_input.addItems(self._recent_searches)
+            self.find_input.setCurrentText(text)
+
+    def _find_regex_or_plain(self, text: str, *, backward: bool = False) -> bool:
+        if not text:
+            return False
+        if not self._find_regex:
+            flags = QTextDocument.FindFlags()
+            if backward:
+                flags |= QTextDocument.FindBackward
+            if self._find_match_case:
+                flags |= QTextDocument.FindCaseSensitively
+            if self._find_whole_word:
+                flags |= QTextDocument.FindWholeWords
+            found = self.preview_text.find(text, flags)
+            if not found:
+                cursor = self.preview_text.textCursor()
+                cursor.movePosition(QTextCursor.End if backward else QTextCursor.Start)
+                self.preview_text.setTextCursor(cursor)
+                found = self.preview_text.find(text, flags)
+            return bool(found)
+
+        try:
+            pattern = re.compile(text, 0 if self._find_match_case else re.IGNORECASE)
+        except re.error as e:
+            QMessageBox.warning(self, 'Regex Error', f'Invalid regular expression:\n{e}')
+            return False
+
+        full = self.preview_text.toPlainText()
+        cursor = self.preview_text.textCursor()
+        pos = cursor.selectionStart() if backward else cursor.selectionEnd()
+        matches = list(pattern.finditer(full))
+        if not matches:
+            return False
+        picked = None
+        if backward:
+            for m in reversed(matches):
+                if m.start() < pos:
+                    picked = m
+                    break
+            picked = picked or matches[-1]
+        else:
+            for m in matches:
+                if m.start() > pos:
+                    picked = m
+                    break
+            picked = picked or matches[0]
+
+        c = self.preview_text.textCursor()
+        c.setPosition(picked.start())
+        c.setPosition(picked.end(), QTextCursor.KeepAnchor)
+        self.preview_text.setTextCursor(c)
+        return True
+
+    def action_toggle_inline_find_bar(self):
+        self.find_bar.setVisible(not self.find_bar.isVisible())
+        if self.find_bar.isVisible():
+            self.find_input.setFocus()
+            self.find_input.lineEdit().selectAll()
+
+    def action_find(self):
+        # Use inline find bar as the single Find UI so all find controls
+        # (match case/whole word/regex/in-selection/replace buttons) are always available.
+        if not self.find_bar.isVisible():
+            self.find_bar.setVisible(True)
+            seed = self._selected_text_or_current_line().strip() or self._last_find_text
+            if seed:
+                self.find_input.setCurrentText(seed)
+            self.find_input.setFocus()
+            self.find_input.lineEdit().selectAll()
+            return
+
+        text = self.find_input.currentText().strip()
+        if text:
+            self._last_find_text = text
+            self._remember_search(text)
+            if not self._find_regex_or_plain(text, backward=False):
+                QMessageBox.information(self, 'Find', f'No matches found for: {text}')
+
+    def action_find_next(self):
+        if self.find_bar.isVisible() and self.find_input.currentText().strip():
+            self._last_find_text = self.find_input.currentText().strip()
+        if not self._last_find_text:
+            self.action_find()
+            return
+        if not self._find_regex_or_plain(self._last_find_text, backward=False):
+            QMessageBox.information(self, 'Find Next', f'No matches found for: {self._last_find_text}')
+
+    def action_find_previous(self):
+        if self.find_bar.isVisible() and self.find_input.currentText().strip():
+            self._last_find_text = self.find_input.currentText().strip()
+        if not self._last_find_text:
+            self.action_find()
+            return
+        if not self._find_regex_or_plain(self._last_find_text, backward=True):
+            QMessageBox.information(self, 'Find Previous', f'No matches found for: {self._last_find_text}')
+
+    def action_replace(self, one_only: bool | None = None):
+        if self.find_bar.isVisible():
+            find_text = self.find_input.currentText().strip()
+            replace_text = self.replace_input.text()
+            if not find_text:
+                return
+            self._last_find_text = find_text
+            self._last_replace_text = replace_text
+            self._remember_search(find_text)
+            replace_all = not bool(one_only)
+        else:
+            # Keep replace workflow in the inline find bar so all related controls
+            # are visible in one place instead of split dialog prompts.
+            self.find_bar.setVisible(True)
+            seed = self._selected_text_or_current_line().strip() or self._last_find_text
+            if seed and not self.find_input.currentText().strip():
+                self.find_input.setCurrentText(seed)
+            if self._last_replace_text and not self.replace_input.text():
+                self.replace_input.setText(self._last_replace_text)
+            self.find_input.setFocus()
+            self.find_input.lineEdit().selectAll()
+            return
+
+        code = self.preview_text.toPlainText()
+        scope_start = 0
+        scope_end = len(code)
+        sel_cursor = self.preview_text.textCursor()
+        if self._replace_in_selection and sel_cursor.hasSelection():
+            scope_start = min(sel_cursor.selectionStart(), sel_cursor.selectionEnd())
+            scope_end = max(sel_cursor.selectionStart(), sel_cursor.selectionEnd())
+
+        segment = code[scope_start:scope_end]
+        if self._find_regex:
+            try:
+                pattern = re.compile(find_text, 0 if self._find_match_case else re.IGNORECASE)
+            except re.error as e:
+                QMessageBox.warning(self, 'Regex Error', f'Invalid regular expression:\n{e}')
+                return
+        else:
+            pattern = re.compile((rf'\\b{re.escape(find_text)}\\b' if self._find_whole_word else re.escape(find_text)), 0 if self._find_match_case else re.IGNORECASE)
+
+        if replace_all:
+            new_segment, count = pattern.subn(replace_text, segment)
+            if count <= 0:
+                QMessageBox.information(self, 'Replace', f'No matches found for: {find_text}')
+                return
+            new_code = code[:scope_start] + new_segment + code[scope_end:]
+            self._set_preview_text_programmatic(new_code)
+            self._dirty_mark()
+            QMessageBox.information(self, 'Replace', f'Replaced {count} occurrence(s).')
+            return
+
+        m = pattern.search(segment)
+        if not m:
+            QMessageBox.information(self, 'Replace', f'No matches found for: {find_text}')
+            return
+        abs_start, abs_end = scope_start + m.start(), scope_start + m.end()
+        c = self.preview_text.textCursor()
+        c.setPosition(abs_start)
+        c.setPosition(abs_end, QTextCursor.KeepAnchor)
+        c.insertText(replace_text)
+        self._dirty_mark()
+
+    def action_duplicate_selection_or_line(self):
+        cursor = self.preview_text.textCursor()
+        if cursor.hasSelection():
+            text = cursor.selectedText().replace('\u2029', '\n')
+            cursor.insertText(text)
+        else:
+            cursor.select(QTextCursor.LineUnderCursor)
+            line = cursor.selectedText().replace('\u2029', '\n')
+            cursor.movePosition(QTextCursor.EndOfBlock)
+            cursor.insertText('\n' + line)
+        self._dirty_mark()
+
+    def action_move_selection_or_line(self, direction: int):
+        if direction not in (-1, 1):
+            return
+        cursor = self.preview_text.textCursor()
+        doc = self.preview_text.document()
+        sel_start = min(cursor.selectionStart(), cursor.selectionEnd())
+        sel_end = max(cursor.selectionStart(), cursor.selectionEnd())
+        work = QTextCursor(doc)
+        work.setPosition(sel_start)
+        work.movePosition(QTextCursor.StartOfBlock)
+        block_start = work.blockNumber()
+        work.setPosition(sel_end)
+        if work.atBlockStart() and sel_end > sel_start:
+            work.movePosition(QTextCursor.PreviousBlock)
+        block_end = work.blockNumber()
+        lines = self.preview_text.toPlainText().split('\n')
+        if block_start < 0 or block_end >= len(lines):
+            return
+        if direction < 0 and block_start == 0:
+            return
+        if direction > 0 and block_end >= len(lines) - 1:
+            return
+        chunk = lines[block_start:block_end + 1]
+        del lines[block_start:block_end + 1]
+        insert_at = block_start - 1 if direction < 0 else block_start + 1
+        for i, ln in enumerate(chunk):
+            lines.insert(insert_at + i, ln)
+        self._set_preview_text_programmatic('\n'.join(lines))
+        new_line = insert_at
+        b = self.preview_text.document().findBlockByLineNumber(new_line)
+        if b.isValid():
+            c = self.preview_text.textCursor()
+            c.setPosition(b.position())
+            self.preview_text.setTextCursor(c)
+        self._dirty_mark()
+
+    def _current_source_mode(self) -> str:
+        if self._raw_import_code is not None:
+            return 'imported'
+        if self._preview_user_edited:
+            return 'edited'
+        return 'generated'
+
+    def _on_protected_edit_attempted(self):
+        """Flash a read-only warning in the editor status bar for 2.5 s."""
+        if not hasattr(self, 'preview_status_label'):
+            return
+        self.preview_status_label.setText(
+            'Window build region is read-only — use the canvas to edit widgets'
+        )
+        self.preview_status_label.setStyleSheet(
+            'color: #ff8a8a; font-size: 10px; padding: 2px 2px 0px;'
+        )
+        if not hasattr(self, '_protected_warning_timer'):
+            from PySide6.QtCore import QTimer
+            self._protected_warning_timer = QTimer(self)
+            self._protected_warning_timer.setSingleShot(True)
+            self._protected_warning_timer.timeout.connect(self._clear_protected_warning)
+        self._protected_warning_timer.start(2500)
+
+    def _clear_protected_warning(self):
+        self.preview_status_label.setStyleSheet(
+            'color: #888; font-size: 10px; padding: 2px 2px 0px;'
+        )
+        self._update_editor_status()
+
+    def _update_editor_status(self):
+        if not hasattr(self, 'preview_text'):
+            return
+        c = self.preview_text.textCursor()
+        line = c.blockNumber() + 1
+        col = c.columnNumber() + 1
+        sel_len = abs(c.selectionEnd() - c.selectionStart())
+        source = self._current_source_mode()
+        dirty = ' *dirty*' if self.preview_text.toPlainText() != self._generated_code_snapshot else ''
+        self.preview_status_label.setText(f'Ln {line}, Col {col} | Sel {sel_len} | {source}{dirty}')
+        if not self._cursor_history_nav:
+            pos = c.position()
+            if not self._cursor_history or self._cursor_history[-1] != pos:
+                self._cursor_history.append(pos)
+                self._cursor_history = self._cursor_history[-200:]
+                self._cursor_history_index = len(self._cursor_history) - 1
+
+    def action_trim_trailing_whitespace(self):
+        code = self.preview_text.toPlainText()
+        cleaned = '\n'.join(line.rstrip() for line in code.split('\n'))
+        if cleaned != code:
+            self._set_preview_text_programmatic(cleaned)
+            self._dirty_mark()
+
+    def action_normalize_tabs_to_spaces(self):
+        code = self.preview_text.toPlainText()
+        cleaned = code.replace('\t', '    ')
+        if cleaned != code:
+            self._set_preview_text_programmatic(cleaned)
+            self._dirty_mark()
+
+    def action_toggle_bookmark(self):
+        line = self.preview_text.textCursor().blockNumber()
+        if line in self._bookmark_lines:
+            self._bookmark_lines.remove(line)
+        else:
+            self._bookmark_lines.add(line)
+        self._flash_preview_line(line)
+
+    def _goto_bookmark(self, forward: bool):
+        if not self._bookmark_lines:
+            return
+        current = self.preview_text.textCursor().blockNumber()
+        lines = sorted(self._bookmark_lines)
+        if forward:
+            target = next((ln for ln in lines if ln > current), lines[0])
+        else:
+            target = next((ln for ln in reversed(lines) if ln < current), lines[-1])
+        block = self.preview_text.document().findBlockByLineNumber(target)
+        if block.isValid():
+            c = self.preview_text.textCursor()
+            c.setPosition(block.position())
+            self.preview_text.setTextCursor(c)
+            self.preview_text.centerCursor()
+
+    def action_next_bookmark(self):
+        self._goto_bookmark(True)
+
+    def action_prev_bookmark(self):
+        self._goto_bookmark(False)
+
+    def action_cursor_history(self, step: int):
+        if not self._cursor_history:
+            return
+        idx = max(0, min(len(self._cursor_history) - 1, self._cursor_history_index + step))
+        if idx == self._cursor_history_index:
+            return
+        self._cursor_history_index = idx
+        self._cursor_history_nav = True
+        try:
+            c = self.preview_text.textCursor()
+            c.setPosition(self._cursor_history[idx])
+            self.preview_text.setTextCursor(c)
+            self.preview_text.centerCursor()
+        finally:
+            self._cursor_history_nav = False
+
+    def action_open_symbol(self):
+        code = self.preview_text.toPlainText()
+        symbols = re.findall(r'^\s*(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)', code, re.MULTILINE)
+        names = [f'{kind} {name}' for kind, name in symbols]
+        if not names:
+            QMessageBox.information(self, 'Open Symbol', 'No def/class symbols found.')
+            return
+        picked, ok = QInputDialog.getItem(self, 'Open Symbol', 'Symbol:', names, editable=False)
+        if not ok or not picked:
+            return
+        sym = picked.split(' ', 1)[1]
+        m = re.search(rf'^\s*(def|class)\s+{re.escape(sym)}\b', code, re.MULTILINE)
+        if not m:
+            return
+        block = self.preview_text.document().findBlock(m.start())
+        c = self.preview_text.textCursor()
+        c.setPosition(block.position())
+        self.preview_text.setTextCursor(c)
+        self.preview_text.centerCursor()
+
+    @staticmethod
+    def _line_indent_width(line: str) -> int:
+        return len(line) - len(line.lstrip(' '))
+
+    def _fold_range_from_block(self, block: QTextBlock):
+        if not block.isValid():
+            return None
+        text = block.text()
+        if not re.match(r'^\s*(def|class)\s+[A-Za-z_][A-Za-z0-9_]*', text):
+            return None
+        base_indent = self._line_indent_width(text)
+        start = block.next()
+        if not start.isValid():
+            return None
+        end = None
+        b = start
+        while b.isValid():
+            t = b.text()
+            if t.strip() == '':
+                b = b.next()
+                continue
+            indent = self._line_indent_width(t)
+            if indent <= base_indent:
+                break
+            end = b
+            b = b.next()
+        if end is None or end.blockNumber() < start.blockNumber():
+            return None
+        return start, end
+
+    def action_toggle_fold_current(self, line_no: int | None = None):
+        if isinstance(line_no, int) and line_no > 0:
+            block = self.preview_text.document().findBlockByLineNumber(line_no - 1)
+        else:
+            block = self.preview_text.textCursor().block()
+        rng = self._fold_range_from_block(block)
+        if rng is None:
+            return
+        start, end = rng
+        hide = start.isVisible()
+        b = start
+        while b.isValid() and b.blockNumber() <= end.blockNumber():
+            b.setVisible(not hide)
+            b.setLineCount(1 if not hide else 0)
+            b = b.next()
+        self.preview_text.document().markContentsDirty(start.position(), end.position() - start.position() + end.length())
+        self.preview_text.viewport().update()
+
+    def action_unfold_all(self):
+        b = self.preview_text.document().firstBlock()
+        while b.isValid():
+            b.setVisible(True)
+            b.setLineCount(1)
+            b = b.next()
+        self.preview_text.document().markContentsDirty(0, self.preview_text.document().characterCount())
+        self.preview_text.viewport().update()
+
+    def action_lint_check(self):
+        import ast
+        code = self.preview_text.toPlainText()
+        try:
+            ast.parse(code)
+            QMessageBox.information(self, 'Lint Check', 'Syntax check passed.')
+        except SyntaxError as e:
+            QMessageBox.warning(self, 'Lint Check', f'Syntax error at line {e.lineno}, column {e.offset}:\n{e.msg}')
+
+    def action_snapshot_compare(self):
+        current = self.preview_text.toPlainText()
+        generated = self._generated_code_snapshot or ''
+        if current == generated:
+            QMessageBox.information(self, 'Snapshot Compare', 'No differences between generated and editor content.')
+            return
+        import difflib
+        diff = ''.join(difflib.unified_diff(generated.splitlines(True), current.splitlines(True), fromfile='generated', tofile='editor'))
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Snapshot Compare')
+        dlg.resize(900, 600)
+        layout = QVBoxLayout(dlg)
+        txt = QPlainTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText(diff[:20000] or '(Diff too large or unavailable)')
+        layout.addWidget(txt)
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
+        dlg.exec()
+
+    def action_go_to_line(self):
+        text = self.preview_text.toPlainText()
+        line_count = max(1, text.count('\n') + 1)
+        line_no, ok = QInputDialog.getInt(
+            self,
+            'Go to Line',
+            f'Line number (1-{line_count}):',
+            value=1,
+            min=1,
+            max=line_count,
+            step=1,
+        )
+        if not ok:
+            return
+
+        block = self.preview_text.document().findBlockByLineNumber(line_no - 1)
+        if not block.isValid():
+            return
+        cursor = self.preview_text.textCursor()
+        cursor.setPosition(block.position())
+        self.preview_text.setTextCursor(cursor)
+        self.preview_text.centerCursor()
+        self._set_active_panel('preview')
+
     # ── File menu actions ─────────────────────────────────────────────────────
 
     # ── recent files ──────────────────────────────────────────────────────────
@@ -3664,6 +4118,156 @@ class PyFlameBuilder(QMainWindow):
 
     def _settings(self):
         return QSettings('PyFlameUIBuilder', 'PyFlameUIBuilder')
+
+    @staticmethod
+    def _parse_saved_sizes(raw) -> list[int]:
+        """Normalize QSettings splitter sizes across Qt/Python variants."""
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple)):
+            out = []
+            for x in raw:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    pass
+            return [v for v in out if v >= 0]
+        if isinstance(raw, str):
+            parts = re.findall(r'-?\d+', raw)
+            return [int(p) for p in parts] if parts else []
+        return []
+
+    def _restore_window_layout_settings(self):
+        s = self._settings()
+        try:
+            g = s.value('window/geometry')
+            if g:
+                self.restoreGeometry(g)
+        except Exception:
+            pass
+        try:
+            st = s.value('window/state')
+            if st:
+                self.restoreState(st)
+        except Exception:
+            pass
+
+        # Apply splitter/layout settings after Qt finishes initial layout.
+        def _apply_late_layout():
+            try:
+                sizes = self._parse_saved_sizes(s.value('window/main_split_sizes', defaultValue=None))
+                if len(sizes) >= 3:
+                    # Keep current 3-pane layout: preview | canvas | properties.
+                    self.main_split.setSizes(sizes[-3:])
+            except Exception:
+                pass
+            try:
+                rsizes = self._parse_saved_sizes(s.value('window/right_split_sizes', defaultValue=None))
+                if len(rsizes) >= 2 and hasattr(self, 'right_split'):
+                    self.right_split.setSizes(rsizes[:2])
+            except Exception:
+                pass
+            try:
+                preview_visible = s.value('ui/preview_visible', defaultValue=True, type=bool)
+                self._set_preview_visible(bool(preview_visible))
+            except Exception:
+                pass
+            try:
+                active_panel = s.value('ui/active_panel', defaultValue='', type=str) or None
+                if active_panel in {'preview', 'props', 'widgets', 'ui'}:
+                    self._set_active_panel(active_panel)
+            except Exception:
+                pass
+
+        QTimer.singleShot(0, _apply_late_layout)
+
+    def _save_window_layout_settings(self):
+        s = self._settings()
+        try:
+            s.setValue('window/geometry', self.saveGeometry())
+            s.setValue('window/state', self.saveState())
+            s.setValue('window/main_split_sizes', self.main_split.sizes())
+            if hasattr(self, 'right_split'):
+                s.setValue('window/right_split_sizes', self.right_split.sizes())
+            s.setValue('ui/preview_visible', bool(self._preview_visible))
+            s.setValue('ui/active_panel', self._active_work_panel or self._active_aux_panel or '')
+            s.sync()
+        except Exception:
+            pass
+
+
+    def _read_whats_new_points(self, version: str | None = None) -> list[str]:
+        target = (version or APP_VERSION).strip()
+        if not os.path.exists(CHANGELOG_PATH):
+            return []
+
+        points: list[str] = []
+        in_target = False
+        try:
+            with open(CHANGELOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+                for raw in f:
+                    line = raw.strip()
+                    m = re.match(r'^##\s+\[(.+?)\]', line)
+                    if m:
+                        if in_target:
+                            break
+                        in_target = (m.group(1).strip() == target)
+                        continue
+                    if in_target and line.startswith('- '):
+                        points.append(line[2:].strip())
+        except Exception:
+            return []
+        return [p for p in points if p]
+
+    def _list_whats_new_versions(self) -> list[str]:
+        if not os.path.exists(CHANGELOG_PATH):
+            return []
+
+        versions: list[str] = []
+        try:
+            with open(CHANGELOG_PATH, 'r', encoding='utf-8', errors='ignore') as f:
+                for raw in f:
+                    line = raw.strip()
+                    m = re.match(r'^##\s+\[(.+?)\]', line)
+                    if m:
+                        versions.append(m.group(1).strip())
+        except Exception:
+            return []
+
+        return versions
+
+    def action_open_whats_new(self, version: str):
+        points = self._read_whats_new_points(version)
+        if points:
+            bullets = '\n'.join(f'• {p}' for p in points)
+        else:
+            bullets = '• No details listed for this version yet.'
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.NoIcon)
+        msg.setWindowTitle(f"What's New — {version}")
+        msg.setText(f"{APP_NAME}\nVersion {version}\n\nWhat's New:\n{bullets}")
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
+
+    def _show_whats_new_if_needed(self):
+        s = self._settings()
+        seen = s.value('whatsNewSeenVersion', defaultValue='', type=str) or ''
+        if seen == APP_VERSION:
+            return
+
+        points = self._read_whats_new_points(APP_VERSION)
+        if points:
+            bullets = '\n'.join(f'• {p}' for p in points)
+        else:
+            bullets = '• Improvements and fixes in this release.'
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.NoIcon)
+        msg.setWindowTitle(f"What's New — {APP_NAME}")
+        msg.setText(f"{APP_NAME}\nVersion {APP_VERSION}\n\nWhat's New:\n{bullets}")
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
+        s.setValue('whatsNewSeenVersion', APP_VERSION)
 
     def _recent_files(self) -> list[str]:
         s = self._settings()
@@ -3732,17 +4336,19 @@ class PyFlameBuilder(QMainWindow):
             return self._save()
         return reply == QMessageBox.Discard
 
-    def _new(self):
-        if not self._check_unsaved():
-            return
+    def _new_project_no_prompt(self):
+        self._raw_import_code = None
+        self._preview_user_edited = False
         for c in list(self.canvas.containers):
             c.deleteLater()
         self.canvas.containers.clear()
         self.canvas.selected_container = None
         self.config = WindowConfig()
-        self.config_bar.load_config(self.config)
-        self.canvas.update_config(self.config)
-        self.props.clear()
+        self.windows = [ScriptWindow(function_name='main_window', grid_columns=self.config.grid_columns, grid_rows=self.config.grid_rows, widgets=[])]
+        self.active_window_index = 0
+        self._rebuild_window_tabs()
+        self._sync_canvas_from_active_window()
+        self._show_active_window_properties()
         self._save_path = None
         self._clean_mark()
         self._refresh_preview()
@@ -3750,6 +4356,11 @@ class PyFlameBuilder(QMainWindow):
         self._history_index = -1
         self._record_history_state()
         self._update_undo_redo_actions()
+
+    def _new(self):
+        if not self._check_unsaved():
+            return
+        self._new_project_no_prompt()
 
     def _open(self):
         if not self._check_unsaved():
@@ -3762,9 +4373,126 @@ class PyFlameBuilder(QMainWindow):
             return
         self._load_project(path)
 
-    def _load_project(self, path: str):
+    def _normalize_imported_properties(self, widget_type: str, props: dict) -> dict:
+        specs = WIDGET_SPECS.get(widget_type, {})
+        prop_defs = {p.name: p for p in specs.get('props', [])}
+        out = dict(props or {})
+        for key, pdef in prop_defs.items():
+            if key not in out:
+                continue
+            val = out[key]
+            if pdef.kind == 'enum' and isinstance(val, str):
+                # Accept dotted enum forms like Color.RED or direct RED.
+                enum_token = val.split('.')[-1]
+                if enum_token in (pdef.options or []):
+                    out[key] = enum_token
+            elif pdef.kind == 'bool' and not isinstance(val, bool):
+                if isinstance(val, str):
+                    out[key] = val.strip().lower() in ('1', 'true', 'yes', 'on')
+                else:
+                    out[key] = bool(val)
+            elif pdef.kind == 'int' and not isinstance(val, int):
+                try:
+                    out[key] = int(val)
+                except Exception:
+                    out[key] = pdef.default
+            elif pdef.kind == 'list' and isinstance(val, tuple):
+                out[key] = list(val)
+        return out
+
+    def _import_script_from_path(self, path: str, interactive: bool = True) -> tuple[bool, str]:
+        """Import script windows into current project state.
+
+        This method intentionally delegates conversion details to workflow/services
+        so UI code only coordinates prompts + state assignment.
+        """
+        if not path:
+            return False, 'No path provided'
+
         try:
-            config, widgets = ProjectSerializer.load(path)
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                code = f.read()
+        except Exception as e:
+            if interactive:
+                QMessageBox.critical(self, 'Import Error', f'Failed to read script:\n{e}')
+            return False, f'Failed to read script: {e}'
+
+        class_names = detect_classes(code)
+        if not class_names:
+            if interactive:
+                QMessageBox.information(self, 'Import Script', 'No classes found in script. Nothing to import yet.')
+            return False, 'No classes found'
+
+        target_class = class_names[0]
+        if interactive and len(class_names) > 1:
+            target_class, ok = QInputDialog.getItem(
+                self,
+                'Select Class to Import',
+                'Multiple classes found. Import window methods from:',
+                class_names,
+                0,
+                False,
+            )
+            if not ok:
+                return False, 'Class selection cancelled'
+
+        windows_meta = analyze_create_windows(code, target_class)
+        if not windows_meta:
+            windows_meta = analyze_create_windows(code, None)
+        if not windows_meta:
+            msg = (
+                f'No window-build methods found in class "{target_class}".\n\n'
+                'Importer looks for [Start Window Build]/[End Window Build] markers (or create_*/main_window methods).'
+            )
+            if interactive:
+                QMessageBox.information(self, 'Import Script', msg)
+            return False, msg
+
+        imported_windows, skipped_items = build_imported_windows(
+            windows_meta,
+            widget_specs=WIDGET_SPECS,
+            normalize_properties=self._normalize_imported_properties,
+        )
+
+        self.config.script_name = suggest_script_name_from_path(path)
+        self._preview_user_edited = False
+        self.windows = imported_windows
+        self.active_window_index = 0
+        self._rebuild_window_tabs()
+        self._sync_canvas_from_active_window()
+        self._raw_import_code = code
+        self._refresh_preview()
+        self._dirty_mark()
+
+        text = summarize_import_result(imported_windows, skipped_items, target_class)
+        if interactive:
+            msg = QMessageBox(self)
+            msg.setWindowTitle('Import Complete')
+            msg.setText(text + '\n\nBeta note: complex/custom widget logic may be skipped in this phase.')
+            msg.setIcon(QMessageBox.NoIcon)
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec()
+        return True, text
+
+    def action_import_existing_script(self):
+        if not self._check_unsaved():
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Import Script',
+            '',
+            'Python Script (*.py);;All Files (*)',
+        )
+        if not path:
+            return
+        self._import_script_from_path(path, interactive=True)
+
+    def _load_project(self, path: str):
+        self._raw_import_code = None
+        self._preview_user_edited = False
+        try:
+            config, windows, active_window = ProjectSerializer.load(path)
         except Exception as e:
             QMessageBox.critical(self, 'Error', f'Failed to load project:\n{e}')
             return
@@ -3775,25 +4503,12 @@ class PyFlameBuilder(QMainWindow):
         self.canvas.selected_container = None
 
         self.config = config
-        self.config_bar.load_config(config)
-        self.canvas.update_config(config)
+        self.windows = windows or [ScriptWindow(function_name='main_window', grid_columns=config.grid_columns, grid_rows=config.grid_rows, widgets=[])]
+        self.active_window_index = max(0, min(active_window, len(self.windows)-1))
+        self._rebuild_window_tabs()
+        self._sync_canvas_from_active_window()
 
-        for model in widgets:
-            if model.widget_type not in WIDGET_SPECS:
-                print(f'Skipping unknown widget type: {model.widget_type}')
-                continue
-            try:
-                widget = WidgetContainer.make_widget(model.widget_type, model.properties)
-                container = WidgetContainer(widget, model, self.canvas)
-                container.setGeometry(
-                    self.canvas.cell_rect(model.row, model.col, model.row_span, model.col_span)
-                )
-                container.show()
-                self.canvas.containers.append(container)
-            except Exception as e:
-                print(f'Error loading {model.widget_type}: {e}')
-
-        self.props.clear()
+        self._show_active_window_properties()
         self._save_path = path
         self._add_recent_file(path)
         self._clean_mark()
@@ -3807,8 +4522,8 @@ class PyFlameBuilder(QMainWindow):
         if self._save_path is None:
             return self._save_as()
         try:
-            models = [c.model for c in self.canvas.containers]
-            ProjectSerializer.save(self._save_path, self.config, models)
+            self._persist_active_window()
+            ProjectSerializer.save(self._save_path, self.config, self.windows, active_window=self.active_window_index)
             self._add_recent_file(self._save_path)
             self._clean_mark()
             return True
@@ -3843,9 +4558,10 @@ class PyFlameBuilder(QMainWindow):
         return None
 
     def _generate_code(self):
-        models    = [c.model for c in self.canvas.containers]
-        tab_order = self._prompt_tab_order(models)
-        code = CodeGenerator.generate(self.config, models, tab_order=tab_order)
+        self._persist_active_window()
+        current_models = [c.model for c in self.canvas.containers]
+        tab_order = self._prompt_tab_order(current_models)
+        code = CodeGenerator.generate(self.config, current_models, tab_order=tab_order, windows=self.windows)
 
         dlg = QDialog(self)
         dlg.setWindowTitle('Generated Code')
@@ -3880,12 +4596,155 @@ class PyFlameBuilder(QMainWindow):
 
     # ── script generation ─────────────────────────────────────────────────────
 
-    def _generate_script(self):
-        if not os.path.isdir(TEMPLATE_DIR):
-            QMessageBox.critical(self, 'Error',
-                f'Template folder not found:\n{TEMPLATE_DIR}')
+    def _export_script_to_dir(self, output_dir: str, *, overwrite: bool, interactive: bool, reveal: bool) -> tuple[bool, str]:
+        """Export current builder state to a Flame-ready script folder."""
+        # Interactive mode is allowed to prompt before overwrite.
+        effective_overwrite = overwrite
+
+        # Warn (but allow) duplicate window names because they can produce
+        # ambiguous generated method names and unexpected behavior.
+        names = [(w.function_name or '').strip() for w in self.windows]
+        dupes = sorted({n for n in names if n and names.count(n) > 1})
+        if interactive and dupes:
+            msg = QMessageBox(self)
+            msg.setWindowTitle('Duplicate Window Names Detected')
+            msg.setText(
+                'Two or more windows share the same name. This may cause problems in exported scripts.\n\n'
+                f'Duplicates: {", ".join(dupes)}\n\n'
+                'Do you want to continue exporting?'
+            )
+            msg.setIcon(QMessageBox.NoIcon)
+            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+            msg.setDefaultButton(QMessageBox.Cancel)
+            if msg.exec() != QMessageBox.Yes:
+                return False, 'Export cancelled'
+        if interactive and not overwrite:
+            snake = to_snake(self.config.script_name)
+            script_dir = os.path.join(output_dir, snake)
+            if os.path.exists(script_dir):
+                msg = QMessageBox(self)
+                msg.setWindowTitle('Folder Exists')
+                msg.setText(f'A folder named "{snake}" already exists at:\n{output_dir}\n\nOverwrite it?')
+                msg.setIcon(QMessageBox.NoIcon)
+                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+                if msg.exec() != QMessageBox.Yes:
+                    return False, 'Export cancelled'
+                effective_overwrite = True
+
+        try:
+            ok, dir_or_err, snake = prepare_export_tree(
+                TEMPLATE_DIR,
+                output_dir,
+                self.config.script_name,
+                overwrite=effective_overwrite,
+            )
+            if not ok:
+                return False, dir_or_err
+            script_dir = dir_or_err
+
+            self._persist_active_window()
+            current_models = [c.model for c in self.canvas.containers]
+            tab_order = self._prompt_tab_order(current_models) if interactive else None
+            generated_code = CodeGenerator.generate(self.config, current_models, tab_order=tab_order, windows=self.windows)
+            edited_code = self.preview_text.toPlainText()
+
+            def _select_target_class(class_names: list[str]) -> str | None:
+                if not interactive:
+                    return class_names[0] if class_names else None
+                selected, ok = QInputDialog.getItem(
+                    self,
+                    'Select Target Class',
+                    'Multiple classes found. Insert generated windows into:',
+                    class_names,
+                    0,
+                    False,
+                )
+                if not ok:
+                    return None
+                return selected
+
+            ok_code, code_or_err, _mode = decide_export_code(
+                generated_code=generated_code,
+                edited_code=edited_code,
+                preview_user_edited=self._preview_user_edited,
+                raw_import_code=self._raw_import_code,
+                windows=self.windows,
+                class_selector=_select_target_class,
+            )
+            if not ok_code:
+                return False, code_or_err
+
+            with open(os.path.join(script_dir, f'{snake}.py'), 'w') as f:
+                f.write(code_or_err)
+
+            if self.config.license_type != 'None':
+                self._write_license_file(script_dir, self.config.license_type)
+
+        except Exception as e:
+            return False, f'Failed to export script: {e}'
+
+        if reveal:
+            self._reveal_in_finder(script_dir)
+        return True, script_dir
+
+    def _collect_export_preflight_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        names = [w.function_name for w in self.windows if (w.function_name or '').strip()]
+        dups = sorted({n for n in names if names.count(n) > 1})
+        if dups:
+            warnings.append(f'Duplicate window function names: {", ".join(dups)}')
+        known = {w.function_name for w in self.windows}
+        unresolved = sorted({w.parent_window for w in self.windows if getattr(w, 'parent_window', None) and w.parent_window not in known})
+        if unresolved:
+            warnings.append(f'Unresolved parent window references: {", ".join(unresolved)}')
+        if self._preview_user_edited and self.preview_text.toPlainText() != self._generated_code_snapshot:
+            warnings.append('Manual edits diverge from generated code; export will prefer editor content.')
+        return warnings
+
+    def _show_export_preflight(self) -> bool:
+        warnings = self._collect_export_preflight_warnings()
+        if not warnings:
+            return True
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Export Preflight')
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText('Please review preflight warnings before export:')
+        msg.setInformativeText('\n'.join(f'• {w}' for w in warnings))
+        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        return msg.exec() == QMessageBox.Ok
+
+    def _export_ui_code_only(self):
+        text = self.preview_text.toPlainText() if hasattr(self, 'preview_text') else ''
+        ranges = self._protected_window_build_ranges(text)
+        if not ranges:
+            QMessageBox.information(self, 'Export UI Code Only', 'No protected UI Window Build sections found.')
             return
 
+        blocks = [text[s:e].rstrip() for s, e in ranges]
+        payload = '\n\n'.join(blocks).rstrip() + '\n'
+
+        default_name = f"{to_snake(getattr(self.config, 'script_name', 'script') or 'script')}_ui_code.py"
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            'Export UI Code Only',
+            default_name,
+            'Python Script (*.py);;All Files (*)',
+        )
+        if not out_path:
+            return
+
+        try:
+            with open(out_path, 'w', encoding='utf-8') as fh:
+                fh.write(payload)
+        except Exception as e:
+            QMessageBox.critical(self, 'Error', f'Failed to export UI code:\n{e}')
+            return
+
+        QMessageBox.information(self, 'Export UI Code Only', f'UI code exported successfully:\n{out_path}')
+
+    def _generate_script(self):
+        if not self._show_export_preflight():
+            return
         output_dir = QFileDialog.getExistingDirectory(
             self, 'Select Output Directory', '',
             QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks,
@@ -3893,60 +4752,15 @@ class PyFlameBuilder(QMainWindow):
         if not output_dir:
             return
 
-        snake      = _to_snake(self.config.script_name)
-        script_dir = os.path.join(output_dir, snake)
-
-        if os.path.exists(script_dir):
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Folder Exists')
-            msg.setText(f'A folder named "{snake}" already exists at:\n{output_dir}\n\nOverwrite it?')
-            msg.setIcon(QMessageBox.NoIcon)
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-            if msg.exec() != QMessageBox.Yes:
-                return
-            shutil.rmtree(script_dir)
-
-        try:
-            # Copy template
-            shutil.copytree(TEMPLATE_DIR, script_dir)
-
-            # Remove builder-only template source file from generated output
-            generated_template_py = os.path.join(script_dir, 'script_template.py')
-            if os.path.exists(generated_template_py):
-                os.remove(generated_template_py)
-
-            # Rename lib/pyflame_lib.py → lib/pyflame_lib_{snake}.py
-            lib_src = os.path.join(script_dir, 'lib', 'pyflame_lib.py')
-            lib_dst = os.path.join(script_dir, 'lib', f'pyflame_lib_{snake}.py')
-            if os.path.exists(lib_src):
-                os.rename(lib_src, lib_dst)
-
-            # Rename lib/pyflame_lib.pyi → lib/pyflame_lib_{snake}.pyi
-            lib_stub_src = os.path.join(script_dir, 'lib', 'pyflame_lib.pyi')
-            lib_stub_dst = os.path.join(script_dir, 'lib', f'pyflame_lib_{snake}.pyi')
-            if os.path.exists(lib_stub_src):
-                os.rename(lib_stub_src, lib_stub_dst)
-
-            # Write generated script
-            models    = [c.model for c in self.canvas.containers]
-            tab_order = self._prompt_tab_order(models)
-            code      = CodeGenerator.generate(self.config, models, tab_order=tab_order)
-            with open(os.path.join(script_dir, f'{snake}.py'), 'w') as f:
-                f.write(code)
-
-            # Write LICENSE to script root (if a license was selected)
-            if self.config.license_type != 'None':
-                self._write_license_file(script_dir, self.config.license_type)
-
-        except Exception as e:
-            QMessageBox.critical(self, 'Error', f'Failed to generate script:\n{e}')
+        ok, result = self._export_script_to_dir(output_dir, overwrite=False, interactive=True, reveal=True)
+        if not ok:
+            if result != 'Export cancelled':
+                QMessageBox.critical(self, 'Error', result)
             return
 
-        self._reveal_in_finder(script_dir)
-
         msg = QMessageBox(self)
-        msg.setWindowTitle('Script Generated')
-        msg.setText(f'Script generated successfully:\n{script_dir}\n\n(Revealed in Finder)')
+        msg.setWindowTitle('Script Exported')
+        msg.setText(f'Script exported successfully:\n{result}\n\n(Revealed in Finder)')
         msg.setIcon(QMessageBox.NoIcon)
         msg.setStandardButtons(QMessageBox.Ok)
         msg.exec()
@@ -4085,6 +4899,17 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
     def closeEvent(self, event):
         if self._check_unsaved():
+            self._save_window_layout_settings()
+            try:
+                QApplication.instance().removeEventFilter(self)
+            except Exception:
+                pass
+            try:
+                if self._api_server is not None:
+                    self._api_server.shutdown()
+                    self._api_server.server_close()
+            except Exception:
+                pass
             event.accept()
         else:
             event.ignore()
@@ -4108,37 +4933,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 # Entry Point
 # ==============================================================================
 
-def _init_logging() -> logging.Logger:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    log_dir = os.path.join(base_dir, 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, 'pyflame_builder.log')
-
-    logger = logging.getLogger('pyflame_builder')
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    formatter = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
-
-    has_file = any(isinstance(h, RotatingFileHandler) for h in logger.handlers)
-    has_stdout = any(
-        isinstance(h, logging.StreamHandler) and getattr(h, 'stream', None) is sys.stdout
-        for h in logger.handlers
-    )
-
-    if not has_file:
-        file_handler = RotatingFileHandler(log_path, maxBytes=1_000_000, backupCount=3)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-    if not has_stdout:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
-    return logger
-
-
 def _set_macos_app_name(name: str):
     """Patch process/bundle names so macOS menu bar shows custom app name."""
     try:
@@ -4151,14 +4945,22 @@ def _set_macos_app_name(name: str):
         pass
 
 
-def _load_fonts():
+def _load_fonts() -> str | None:
+    """Load bundled fonts and return preferred family when available."""
     fonts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'fonts')
+    loaded_families: list[str] = []
     for fname in ('Montserrat-Regular.ttf', 'Montserrat-Light.ttf', 'Montserrat-Thin.ttf'):
-        QFontDatabase.addApplicationFont(os.path.join(fonts_dir, fname))
+        font_id = QFontDatabase.addApplicationFont(os.path.join(fonts_dir, fname))
+        if font_id != -1:
+            loaded_families.extend(QFontDatabase.applicationFontFamilies(font_id) or [])
+
+    preferred = next((f for f in loaded_families if isinstance(f, str) and f.strip()), None)
+    return preferred
 
 
 def main():
-    logger = _init_logging()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    logger = init_logging(base_dir)
     logger.info('Starting %s v%s', APP_NAME, APP_VERSION)
 
     def _log_unhandled(exc_type, exc, tb):
@@ -4185,11 +4987,13 @@ def main():
     sys.unraisablehook = _unraisable_hook
 
     app = QApplication.instance() or QApplication(sys.argv)
+    _patch_messagebox_no_icons()
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
     _set_macos_app_name(APP_NAME)
-    _load_fonts()
-    app.setFont(QFont('Montserrat', 10))
+    preferred_font = _load_fonts()
+    if preferred_font:
+        app.setFont(QFont(preferred_font, 10))
     window = PyFlameBuilder()
     window.show()
     rc = app.exec()

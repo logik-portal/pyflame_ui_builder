@@ -2,30 +2,31 @@
 
 ## File
 
-- Cmd/Ctrl+N — New
-- Cmd/Ctrl+O — Open
-- Cmd/Ctrl+S — Save
-- Cmd/Ctrl+Shift+S — Save As
+- Cmd/Ctrl+N — New Project
+- Cmd/Ctrl+O — Open Project
+- Cmd/Ctrl+S — Save Project
+- Cmd/Ctrl+Shift+S — Save Project As
+- Cmd/Ctrl+Shift+G — Export Script
 - Cmd/Ctrl+G — Preview Code
-- Cmd/Ctrl+Shift+G — Generate Script
+- Cmd/Ctrl+Q — Exit
 
 ## Edit
 
 - Cmd/Ctrl+Z — Undo
 - Cmd/Ctrl+Shift+Z — Redo
-- Delete — Delete selected widget
+
+## Code Editor
+
+- Cmd/Ctrl+D — Duplicate line or selection
+- Alt+Up / Alt+Down — Move line/selection up or down
+- Tab / Shift+Tab — Indent/outdent selection (4-space indentation)
 
 ## Canvas
 
-- Arrow keys — Nudge selected widget
+- Delete — Delete selected widget
+- Escape — Deselect selected widget
+- Arrow keys — Nudge selected widget by one cell
 - Middle mouse drag — Pan canvas
-
-## View / Zoom
-
-- Cmd/Ctrl+= — Zoom In
-- Cmd/Ctrl+- — Zoom Out
-- Cmd/Ctrl+0 — 100%
-- Cmd/Ctrl+9 — Fit Canvas
 
 ## App
 

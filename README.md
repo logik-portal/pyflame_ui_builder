@@ -1,6 +1,6 @@
 # PyFlame UI Builder
 
-**Version:** 1.0.0<br>
+**Version:** 1.1.0<br>
 **Author:** Michael Vaglienty<br>
 **License:** GPL-3.0<br>
 **GitHub:** https://github.com/logik-portal/pyflame-ui-builder<br>
@@ -24,12 +24,11 @@ By default windows created with this script will close inside of Flame by hittin
 
 - Python 3.11+
 - PySide6
-- macOS only (optional): `pyobjc-framework-Cocoa`
 
 Install dependencies:
 
 ```bash
-pip3 install -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Run
@@ -41,12 +40,13 @@ python3 pyflame_ui_builder.py
 ## Basic workflow
 
 1. Set script details in the top bar.
-2. Set size in columns and rows of Flame Window. Columns and rows can be added later by adjusting the Flame Window values or right-clicking in the Flame Window UI.
-3. Add widgets to layout by dragging the widget name from the widegts panel to the Flame Window UI.
+2. Set Flame Window columns/rows in the **Properties** panel (shown when no widget is selected). Columns and rows can be adjusted later there or via right-click actions in the Flame Window UI.
+3. Add widgets to layout by dragging the widget name from the widegts panel to the Flame Window UI (including Collections widgets like Table, Tree Widget, and List Widget).
 4. Set widget sizing when available. Some widgets can span multiple grid squares. Resizeable widgets will have handles once dropped in the Flame Window UI.
-5  Adjust widget properties in Widget Property panel.
-4. Preview generated code (optional).
-5. Generate script via **File → Generate Script...**. Set the Flame Python path as the location. Commonly /opt/Autodesk/shared/python.
+5.  Adjust widget properties in Widget Property panel.
+6. Use **Preview: On/Off** in the bottom bar to switch between edit mode and interactive preview mode.
+   - Preview mode enables direct widget interaction and prevents adding new widgets until turned off.
+5. Export script via **File → Export Script...**. Set the Flame Python path as the location. Commonly /opt/Autodesk/shared/python.
 6. Start Flame to preview the new window.
 7. Add custom logic to widgets/script in code editor of your choice. A stub file for the pyflame library is included with the script to assist working with the widgets in your code editor.
 
@@ -67,7 +67,9 @@ Two example files can be loaded from /pyflame_ui_builder/examples
 ## Note
 
 Files created by **File → Save** are not meant to be loaded into Flame. They are just project files for PyFlame UI Builder.
-To create a script that can be loaded in Flame go to **File → Generate Script...**.
+To create a script that can be loaded in Flame go to **File → Export Script...**.
+
+During export, if duplicate window names are detected, you will be warned and can choose to cancel or continue.
 
 ## Canvas controls
 
@@ -75,19 +77,29 @@ To create a script that can be loaded in Flame go to **File → Generate Script.
 - Right-click widget: context menu actions (Undo, optional Redo, Duplicate, Delete)
 - Arrow keys: nudge selected widget by one grid cell
 
+## Multi-window tabs
+
+- The canvas now supports multiple script windows via tabs.
+- Add a tab via tab context menu or the `+` button on the tab row.
+- Remove current tab via tab context menu or the `−` button on the tab row.
+- Rename tabs by double-clicking tab label or from tab context menu.
+- Saving `.pfb` includes all windows; loading supports old single-window `.pfb` files and auto-migrates them.
+
 ## Grid / zoom
 
 Use the bottom control row in the canvas pane for Grid toggle and zoom controls.
 Grid is **Off by default**.
 Grid visibility only affects drawing; snapping remains active.
 
+## Code preview editing
+
+- The **Live Code Preview** panel is editable with exception of the UI code.
+
 ## Help
 
 - Available in the **Help** menu.
-
-Help content is sourced from:
-- `docs/help/getting-started.md`
-- `docs/help/keyboard-shortcuts.md`
+- **File → Export UI Code Only...** exports only protected UI Window Build blocks (`[Start Window Build]` → `[End Window Build]`).
+- Keep generated markers intact in exported scripts so protected UI sections can be updated safely.
 
 ## License
 

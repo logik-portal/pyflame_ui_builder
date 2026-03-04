@@ -1,5 +1,5 @@
 # PyFlame Library
-# Copyright (c) 2025 Michael Vaglienty
+# Copyright (c) 2026 Michael Vaglienty
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,10 +19,10 @@
 
 """
 PyFlame Library
-Version: 5.2.2
+Version: 5.2.4
 Written By: Michael Vaglienty
 Creation Date: 10.31.20
-Update Date: 02.18.26
+Update Date: 02.28.26
 
 License: GNU General Public License v3.0 (GPL-3.0) - see LICENSE file for details
 
@@ -44,6 +44,7 @@ Folder Structure:
     ├── main_script.py
     ├── lib/
     │   └── pyflame_lib_<main_script_name>.py
+    │   └── pyflame_lib_<main_script_name>.pyi   # Optional
     ├── assets/
     │   └── fonts/
     │       ├── Montserrat-Regular.ttf
@@ -3981,6 +3982,8 @@ class PyFlameToolTip:
 
         self._hide_timer = QtCore.QTimer(singleShot=True)
         self._hide_timer.timeout.connect(self._hide_tooltip)
+
+
 
     def __del__(self):
         """
@@ -12575,10 +12578,6 @@ class PyFlameSlider(QtWidgets.QLineEdit):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, **kwargs)
 
-                self._close_check_timer = QtCore.QTimer(self)
-                self._close_check_timer.timeout.connect(self._check_close_on_focus_lost)
-                self._close_check_timer.start(100)  # check every 200 ms
-
             def _check_close_on_focus_lost(self):
                 if not self.isActiveWindow():
                     self._close_check_timer.stop()
@@ -20642,6 +20641,11 @@ class PyFlameWindow(QtWidgets.QDialog):
             Dictionary of row heights to adjust.
             (Default: `{}`)
 
+        `window_margins` (int | tuple[int, int, int, int]):
+            Margin in pixels around the main content area. Pass a single int to use the same value for left, top, right,
+            and bottom; or pass a tuple of four ints for (left, top, right, bottom). Values are scaled by `pyflame.gui_resize()`.
+            (Default: `15`)
+
     Properties
     ----------
         `title` (str):
@@ -20712,6 +20716,11 @@ class PyFlameWindow(QtWidgets.QDialog):
             Get or set the dictionary of row heights to adjust.
             (Default: `{}`)
 
+        `window_margins` (int | tuple[int, int, int, int]):
+            Get or set the margin in pixels around the main content area. Accepts a single int or a tuple of four ints
+            (left, top, right, bottom). Getter always returns a tuple of four ints.
+            (Default: `15`)
+
     Notes
     -----
         For proper sizing of widgets and placement of widgets in the window,
@@ -20771,6 +20780,7 @@ class PyFlameWindow(QtWidgets.QDialog):
                  grid_layout_row_height: int=28,
                  grid_layout_adjust_column_widths: dict[int, int]={},
                  grid_layout_adjust_row_heights: dict[int, int]={},
+                 window_margins: int | tuple[int, int, int, int]=15,
                  ) -> None:
 
         # Validate Parent
@@ -20792,6 +20802,12 @@ class PyFlameWindow(QtWidgets.QDialog):
             align=Align.LEFT,
             )
 
+        # Init window layout widgets
+        self.title_text_hbox = PyFlameHBoxLayout()
+        self.message_bar_hbox = PyFlameHBoxLayout()
+        self.main_vbox2 = PyFlameVBoxLayout()
+        self.center_layout = PyFlameGridLayout() # Main UI added to this widget
+
         #-------------------------------------
         # [Window Properties]
         #-------------------------------------
@@ -20812,6 +20828,7 @@ class PyFlameWindow(QtWidgets.QDialog):
         self.grid_layout_row_height = grid_layout_row_height
         self.grid_layout_adjust_column_widths = grid_layout_adjust_column_widths
         self.grid_layout_adjust_row_heights = grid_layout_adjust_row_heights
+        self.window_margins = window_margins
 
         # Set Window Flags
         self.setWindowFlags(QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint | QtCore.Qt.WindowStaysOnTopHint)
@@ -20825,32 +20842,25 @@ class PyFlameWindow(QtWidgets.QDialog):
         # [Window Layout]
         #-------------------------------------
 
-        title_text_hbox = PyFlameHBoxLayout()
-        title_text_hbox.addWidget(self.title_label)
-        title_text_hbox.setContentsMargins(2, 0, 0, 0)  # Set margin to 2px to account for the line overlay.
+        self.title_text_hbox.addWidget(self.title_label)
+        self.title_text_hbox.setContentsMargins(2, 0, 0, 0)  # Set margin to 2px to account for the line overlay.
 
-        message_bar_hbox = PyFlameHBoxLayout()
-        message_bar_hbox.addWidget(self.message_bar_label)
-        message_bar_hbox.setContentsMargins(2, 0, 0, 0)  # Set margin to 2px to account for the line overlay.
-
-        # Center layout - where main UI is added
-        center_layout = PyFlameGridLayout()
+        self.message_bar_hbox.addWidget(self.message_bar_label)
+        self.message_bar_hbox.setContentsMargins(2, 0, 0, 0)  # Set margin to 2px to account for the line overlay.
 
         # Create widget to hold the center layout
         center_widget = QtWidgets.QWidget()
-        center_widget.setLayout(center_layout)
+        center_widget.setLayout(self.center_layout)
 
         # Add the center layout to the main layout
-        main_vbox2 = PyFlameVBoxLayout()
-        main_vbox2.addWidget(center_widget, alignment=QtCore.Qt.AlignCenter)
-        main_vbox2.addStretch()
-        main_vbox2.setContentsMargins(pyflame.gui_resize(15), pyflame.gui_resize(15), pyflame.gui_resize(15), pyflame.gui_resize(15)) # Add margin around main UI
+        self.main_vbox2.addWidget(center_widget, alignment=QtCore.Qt.AlignCenter)
+        self.main_vbox2.addStretch()
 
         main_vbox3 = PyFlameVBoxLayout()
-        main_vbox3.addLayout(title_text_hbox)
-        main_vbox3.addLayout(main_vbox2)
+        main_vbox3.addLayout(self.title_text_hbox)
+        main_vbox3.addLayout(self.main_vbox2)
         if self.message_bar:
-            main_vbox3.addLayout(message_bar_hbox)
+            main_vbox3.addLayout(self.message_bar_hbox)
         main_vbox3.setContentsMargins(0, 0, 0, 0)  # Remove margins
 
         self.setLayout(main_vbox3)
@@ -20865,7 +20875,7 @@ class PyFlameWindow(QtWidgets.QDialog):
             adjust_row_heights=self.grid_layout_adjust_row_heights,
             )
 
-        center_layout.addLayout(self.grid_layout, 0, 0)
+        self.center_layout.addLayout(self.grid_layout, 0, 0)
 
         # Show Window
         self.show()
@@ -21771,6 +21781,72 @@ class PyFlameWindow(QtWidgets.QDialog):
             pyflame.raise_type_error('PyFlameWindow', 'grid_layout_adjust_row_heights', 'dict', value)
 
         self._grid_layout_adjust_row_heights = value
+
+    @property
+    def window_margins(self) -> tuple[int, int, int, int]:
+        """
+        Window Margins
+        =====================
+
+        Get or set the margin in pixels around the main content area.
+
+        Returns
+        -------
+            tuple[int, int, int, int]:
+                Margins as (left, top, right, bottom).
+
+        Set
+        ---
+            window_margins (int | tuple[int, int, int, int]):
+                A single int (same value for all sides) or a tuple of four ints (left, top, right, bottom).
+
+        Raises
+        ------
+            TypeError:
+                If the provided `value` is not an int or a tuple of four ints.
+
+        Examples
+        --------
+            ```
+            # Get window margins (always returns tuple of four ints)
+            left, top, right, bottom = window.window_margins
+
+            # Set with single int (same for all sides)
+            window.window_margins = 20
+
+            # Set with tuple (left, top, right, bottom)
+            window.window_margins = (10, 15, 10, 15)
+            ```
+        """
+
+        return self.window_margins_value
+
+    @window_margins.setter
+    def window_margins(self, value: int | tuple[int, int, int, int]) -> None:
+        """
+        Window Margins
+        =====================
+
+        Set the margin in pixels around the main content area.
+        """
+
+        # Validate Argument and normalize to (left, top, right, bottom)
+        if isinstance(value, int):
+            margins = (value, value, value, value)
+        elif isinstance(value, tuple) and len(value) == 4:
+            if not all(isinstance(v, int) for v in value):
+                pyflame.raise_type_error('PyFlameWindow', 'window_margins', 'tuple of 4 ints (left, top, right, bottom)', value)
+            margins = value
+        else:
+            pyflame.raise_type_error('PyFlameWindow', 'window_margins', 'int or tuple of 4 ints (left, top, right, bottom)', value)
+
+        self.window_margins_value = margins
+        self.main_vbox2.setContentsMargins(
+            pyflame.gui_resize(margins[0]),
+            pyflame.gui_resize(margins[1]),
+            pyflame.gui_resize(margins[2]),
+            pyflame.gui_resize(margins[3]),
+            )
 
     #-------------------------------------
     # [Methods]
