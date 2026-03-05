@@ -7,9 +7,10 @@ import re
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QMenu, QMessageBox, QWidget
+from PySide6.QtWidgets import QMenu, QWidget
 
 from models.ui_models import PlacedWidget, WindowConfig
+from ui.dialogs import AppMessageDialog
 
 
 class CanvasWidget(QWidget):
@@ -364,16 +365,15 @@ class CanvasWidget(QWidget):
 
         affected = [c for c in self.containers if c.model.row == del_row]
         if confirm and affected:
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Delete Row?')
-            msg.setText(
-                f'Row {del_row + 1} contains {len(affected)} widget(s).\n\n'
-                'Deleting this row will delete those widgets. Continue?'
+            ok = AppMessageDialog.confirm(
+                self.window(),
+                'Delete Row?',
+                f'Row {del_row + 1} contains {len(affected)} widget(s).',
+                informative_text='Delete the row and its widgets?',
+                confirm_label='Delete',
+                danger=True,
             )
-            msg.setIcon(QMessageBox.NoIcon)
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-            msg.setDefaultButton(QMessageBox.Cancel)
-            if msg.exec() != QMessageBox.Yes:
+            if not ok:
                 return
 
         for c in list(self.containers):
@@ -395,16 +395,15 @@ class CanvasWidget(QWidget):
 
         affected = [c for c in self.containers if c.model.col == del_col]
         if confirm and affected:
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Delete Column?')
-            msg.setText(
-                f'Column {del_col + 1} contains {len(affected)} widget(s).\n\n'
-                'Deleting this column will delete those widgets. Continue?'
+            ok = AppMessageDialog.confirm(
+                self.window(),
+                'Delete Column?',
+                f'Column {del_col + 1} contains {len(affected)} widget(s).',
+                informative_text='Delete the column and its widgets?',
+                confirm_label='Delete',
+                danger=True,
             )
-            msg.setIcon(QMessageBox.NoIcon)
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-            msg.setDefaultButton(QMessageBox.Cancel)
-            if msg.exec() != QMessageBox.Yes:
+            if not ok:
                 return
 
         for c in list(self.containers):

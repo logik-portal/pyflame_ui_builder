@@ -116,6 +116,7 @@ from PySide6.QtGui import (
 )
 
 from ui.code_editor import SpacesTabPlainTextEdit, PythonSyntaxHighlighter
+from ui.dialogs import AppMessageDialog, AppTextInputDialog
 
 
 # ==============================================================================
@@ -186,6 +187,23 @@ try:
         _pyflame_mod.pyflame.raise_type_error = _builder_safe_raise_type_error
     except Exception:
         _bootstrap_logger.debug('Could not install builder-safe pyflame type-check shim.')
+
+    # Guard noisy shutdown traceback in preview mode where Qt timers can be
+    # destroyed before PyFlameToolTip.__del__ runs.
+    try:
+        _tooltip_cls = getattr(_pyflame_mod, 'PyFlameToolTip', None)
+        _orig_tooltip_del = getattr(_tooltip_cls, '__del__', None)
+        if _tooltip_cls is not None and callable(_orig_tooltip_del):
+            def _builder_safe_tooltip_del(self):
+                try:
+                    _orig_tooltip_del(self)
+                except RuntimeError as exc:
+                    if 'already deleted' in str(exc):
+                        return
+                    raise
+            _tooltip_cls.__del__ = _builder_safe_tooltip_del
+    except Exception:
+        _bootstrap_logger.debug('Could not install builder-safe tooltip destructor shim.')
 
     _pyflame_loaded = True
     _bootstrap_logger.info('pyflame_lib loaded successfully.')
@@ -891,34 +909,20 @@ def _app_stylesheet() -> str:
 
 
 def _patch_messagebox_no_icons() -> None:
-    """Force static QMessageBox helpers to use NoIcon (no !/? glyphs)."""
+    """Route static QMessageBox helpers through shared app dialog styling."""
 
-    def _show(parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton):
-        msg = QMessageBox(parent)
-        msg.setWindowTitle(title)
-        msg.setText(text)
-        msg.setIcon(QMessageBox.NoIcon)
-        msg.setStandardButtons(buttons)
-        if defaultButton not in (None, QMessageBox.NoButton):
-            msg.setDefaultButton(defaultButton)
-        return msg.exec()
+    def _info_like(parent, title, text, *_args, **_kwargs):
+        AppMessageDialog.info(parent, title, text)
+        return QMessageBox.Ok
 
-    QMessageBox.information = staticmethod(
-        lambda parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton:
-        _show(parent, title, text, buttons, defaultButton)
-    )
-    QMessageBox.warning = staticmethod(
-        lambda parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton:
-        _show(parent, title, text, buttons, defaultButton)
-    )
-    QMessageBox.critical = staticmethod(
-        lambda parent, title, text, buttons=QMessageBox.Ok, defaultButton=QMessageBox.NoButton:
-        _show(parent, title, text, buttons, defaultButton)
-    )
-    QMessageBox.question = staticmethod(
-        lambda parent, title, text, buttons=QMessageBox.Yes | QMessageBox.No, defaultButton=QMessageBox.NoButton:
-        _show(parent, title, text, buttons, defaultButton)
-    )
+    def _question(parent, title, text, *_args, **_kwargs):
+        ok = AppMessageDialog.confirm(parent, title, text, confirm_label='Yes', cancel_label='No')
+        return QMessageBox.Yes if ok else QMessageBox.No
+
+    QMessageBox.information = staticmethod(_info_like)
+    QMessageBox.warning = staticmethod(_info_like)
+    QMessageBox.critical = staticmethod(_info_like)
+    QMessageBox.question = staticmethod(_question)
 
 
 # ==============================================================================
@@ -2085,13 +2089,10 @@ class PyFlameBuilder(QMainWindow):
     def _sync_canvas_from_active_window(self):
         """Load active window model into canvas UI."""
         w = self._current_window()
-        self.config.grid_columns = max(1, int(getattr(w, 'grid_columns', 4) or 4))
-        self.config.grid_rows = max(1, int(getattr(w, 'grid_rows', 3) or 3))
-        self.canvas.update_config(self.config)
-        self.canvas.set_window_margins(getattr(w, 'window_margins', 15))
-        self.canvas.set_window_title_override(getattr(w, 'window_title', None))
 
-        # Clear previous tab widgets from canvas (avoid stale UI when switching tabs).
+        # Clear containers BEFORE updating config so update_config's position-
+        # clamping loop doesn't corrupt the previous window's widget models
+        # (canvas containers hold direct references to the stored model objects).
         for c in list(getattr(self.canvas, 'containers', [])):
             try:
                 c.deleteLater()
@@ -2099,6 +2100,12 @@ class PyFlameBuilder(QMainWindow):
                 pass
         self.canvas.containers = []
         self.canvas.selected_container = None
+
+        self.config.grid_columns = max(1, int(getattr(w, 'grid_columns', 4) or 4))
+        self.config.grid_rows = max(1, int(getattr(w, 'grid_rows', 3) or 3))
+        self.canvas.update_config(self.config)
+        self.canvas.set_window_margins(getattr(w, 'window_margins', 15))
+        self.canvas.set_window_title_override(getattr(w, 'window_title', None))
 
         for model in w.widgets:
             try:
@@ -2152,7 +2159,12 @@ class PyFlameBuilder(QMainWindow):
 
     def action_add_window_tab(self):
         default_name = self._default_new_window_name()
-        name, ok = QInputDialog.getText(self, 'Add Window', 'Window function name:', text=default_name)
+        name, ok = AppTextInputDialog.get_text(
+            self,
+            title='Add Window',
+            label='Window function name:',
+            text=default_name,
+        )
         if not ok:
             return
         fn = re.sub(r'[^a-zA-Z0-9_]+', '_', (name or '').strip()).strip('_') or default_name
@@ -2173,12 +2185,11 @@ class PyFlameBuilder(QMainWindow):
 
     def action_remove_window_tab(self, index: int | None = None):
         if len(self.windows) <= 1:
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Cannot Remove Window')
-            msg.setText('At least one window is required. Add another window before removing this one.')
-            msg.setIcon(QMessageBox.NoIcon)
-            msg.setStandardButtons(QMessageBox.Ok)
-            msg.exec()
+            AppMessageDialog.info(
+                self,
+                'Cannot Remove Window',
+                'At least one window is required. Add another window before removing this one.',
+            )
             return
         idx = self.active_window_index if index is None else int(index)
         if idx < 0 or idx >= len(self.windows):
@@ -2186,16 +2197,14 @@ class PyFlameBuilder(QMainWindow):
 
         # Safety confirmation: removing a tab deletes that window from exported script.
         label = self.windows[idx].function_name or f'window_{idx+1}'
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Delete Window?')
-        msg.setText(
-            f'You are about to delete window "{label}" from this script.\n\n'
-            'Do you want to proceed?'
-        )
-        msg.setIcon(QMessageBox.NoIcon)
-        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-        msg.setDefaultButton(QMessageBox.Cancel)
-        if msg.exec() != QMessageBox.Yes:
+        if not AppMessageDialog.confirm(
+            self,
+            'Delete Window?',
+            f'You are about to delete window "{label}" from this script.',
+            informative_text='Do you want to proceed?',
+            confirm_label='Delete',
+            danger=True,
+        ):
             return
 
         self._persist_active_window()
@@ -2228,7 +2237,12 @@ class PyFlameBuilder(QMainWindow):
         if idx < 0 or idx >= len(self.windows):
             return
         current = self.windows[idx].function_name or f'window_{idx+1}'
-        name, ok = QInputDialog.getText(self, 'Rename Window', 'Window function name:', text=current)
+        name, ok = AppTextInputDialog.get_text(
+            self,
+            title='Rename Window',
+            label='Window function name:',
+            text=current,
+        )
         if not ok:
             return
         fn = re.sub(r'[^a-zA-Z0-9_]+', '_', (name or '').strip()).strip('_') or current
@@ -2352,16 +2366,15 @@ class PyFlameBuilder(QMainWindow):
                     if c.model.row >= new_rows or c.model.col >= new_cols
                 ]
                 if affected:
-                    msg = QMessageBox(self)
-                    msg.setWindowTitle('Grid Shrink Will Delete Widgets')
-                    msg.setText(
-                        f'Reducing window size will delete {len(affected)} widget(s) '\
-                        'from removed rows/columns.\n\nContinue?'
+                    ok = AppMessageDialog.confirm(
+                        self,
+                        'Grid Shrink Will Delete Widgets',
+                        f'Reducing window size will delete {len(affected)} widget(s) from removed rows/columns.',
+                        informative_text='Continue?',
+                        confirm_label='Continue',
+                        danger=True,
                     )
-                    msg.setIcon(QMessageBox.NoIcon)
-                    msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-                    msg.setDefaultButton(QMessageBox.Cancel)
-                    if msg.exec() != QMessageBox.Yes:
+                    if not ok:
                         # Repaint current values in properties panel.
                         self._show_active_window_properties()
                         return
@@ -2702,18 +2715,18 @@ class PyFlameBuilder(QMainWindow):
         dlg.exec()
 
     def action_about(self):
-        msg = QMessageBox(self)
-        msg.setWindowTitle(f'About {APP_NAME}')
-        msg.setIcon(QMessageBox.NoIcon)
-        msg.setText(
-            f'{APP_NAME}\n\n'
-            f'Version: {APP_VERSION}\n'
-            f'Author: {APP_AUTHOR}\n'
-            f'License: {APP_LICENSE}\n\n'
-            f'{APP_DESCRIPTION}\n\n'
-            f'{APP_URL}'
+        AppMessageDialog.info(
+            self,
+            f'About {APP_NAME}',
+            (
+                f'{APP_NAME}\n\n'
+                f'Version: {APP_VERSION}\n'
+                f'Author: {APP_AUTHOR}\n'
+                f'License: {APP_LICENSE}\n\n'
+                f'{APP_DESCRIPTION}\n\n'
+                f'{APP_URL}'
+            ),
         )
-        msg.exec()
 
     def _schedule_preview_update(self, center_on_change: bool = True):
         if not self._preview_auto:
@@ -3227,6 +3240,11 @@ class PyFlameBuilder(QMainWindow):
         # - Deselect only when clicking in the Flame preview region itself
         #   (empty canvas or its surrounding scroll viewport area).
         # - Never deselect from clicks in other UI panels (properties, code preview, menus).
+        #
+        # Side effects (panel highlight, widget deselection) are deferred via
+        # QTimer.singleShot so this method returns immediately without any
+        # synchronous work that could cascade back into the event filter and
+        # cause recursion or block modal dialog event delivery.
         if event.type() in (QEvent.MouseButtonPress, QEvent.FocusIn):
             try:
                 hovered = QApplication.widgetAt(QCursor.pos())
@@ -3247,19 +3265,19 @@ class PyFlameBuilder(QMainWindow):
                 in_ui = self._is_ui_area_widget(obj) or self._is_ui_area_widget(hovered)
 
                 if in_props:
-                    self._set_active_panel('props')
+                    QTimer.singleShot(0, lambda: self._set_active_panel('props'))
                 elif in_preview:
-                    self._set_active_panel('preview')
+                    QTimer.singleShot(0, lambda: self._set_active_panel('preview'))
                 elif in_widgets:
-                    self._set_active_panel('widgets')
+                    QTimer.singleShot(0, lambda: self._set_active_panel('widgets'))
                 elif in_ui:
-                    self._set_active_panel('ui')
+                    QTimer.singleShot(0, lambda: self._set_active_panel('ui'))
 
                 if event.type() == QEvent.MouseButtonPress and getattr(self.canvas, 'selected_container', None) is not None:
                     in_canvas_scroll = self._is_descendant_widget(obj, self.canvas_scroll) or self._is_descendant_widget(hovered, self.canvas_scroll)
                     in_canvas = self._is_descendant_widget(obj, self.canvas) or self._is_descendant_widget(hovered, self.canvas)
                     if in_canvas_scroll and not in_canvas:
-                        self.canvas.select_widget(None)
+                        QTimer.singleShot(0, lambda: self.canvas.select_widget(None))
             except Exception:
                 pass
         return super().eventFilter(obj, event)
@@ -3354,19 +3372,20 @@ class PyFlameBuilder(QMainWindow):
                     # User logic edits stay intact; only builder-owned UI blocks update.
                     code = merged
                 else:
-                    msg = QMessageBox(self)
-                    msg.setWindowTitle('Manual Edits Detected')
-                    msg.setText('Auto Update Code wants to regenerate, but manual edits would be overwritten.')
-                    keep_btn = msg.addButton('Keep My Edits', QMessageBox.AcceptRole)
-                    overwrite_btn = msg.addButton('Overwrite with Generated', QMessageBox.DestructiveRole)
-                    pause_btn = msg.addButton('Disable Auto Update', QMessageBox.RejectRole)
-                    msg.exec()
-                    clicked = msg.clickedButton()
-                    if clicked is keep_btn:
+                    dlg = AppMessageDialog(
+                        self,
+                        title='Manual Edits Detected',
+                        text='Auto Update Code wants to regenerate, but manual edits would be overwritten.',
+                    )
+                    dlg.add_action('keep', 'Keep My Edits', default=True, escape=True)
+                    dlg.add_action('overwrite', 'Overwrite with Generated', danger=True)
+                    dlg.add_action('pause', 'Disable Auto Update', primary=True)
+                    action = dlg.run()
+                    if action == 'keep':
                         self._generated_code_snapshot = code
                         self._update_editor_status()
                         return
-                    if clicked is pause_btn:
+                    if action == 'pause':
                         self.preview_auto_check.setChecked(False)
                         self._generated_code_snapshot = code
                         self._update_editor_status()
@@ -4242,12 +4261,11 @@ class PyFlameBuilder(QMainWindow):
             bullets = '\n'.join(f'• {p}' for p in points)
         else:
             bullets = '• No details listed for this version yet.'
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.NoIcon)
-        msg.setWindowTitle(f"What's New — {version}")
-        msg.setText(f"{APP_NAME}\nVersion {version}\n\nWhat's New:\n{bullets}")
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec()
+        AppMessageDialog.info(
+            self,
+            f"What's New — {version}",
+            f"{APP_NAME}\nVersion {version}\n\nWhat's New:\n{bullets}",
+        )
 
     def _show_whats_new_if_needed(self):
         s = self._settings()
@@ -4261,12 +4279,11 @@ class PyFlameBuilder(QMainWindow):
         else:
             bullets = '• Improvements and fixes in this release.'
 
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.NoIcon)
-        msg.setWindowTitle(f"What's New — {APP_NAME}")
-        msg.setText(f"{APP_NAME}\nVersion {APP_VERSION}\n\nWhat's New:\n{bullets}")
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec()
+        AppMessageDialog.info(
+            self,
+            f"What's New — {APP_NAME}",
+            f"{APP_NAME}\nVersion {APP_VERSION}\n\nWhat's New:\n{bullets}",
+        )
         s.setValue('whatsNewSeenVersion', APP_VERSION)
 
     def _recent_files(self) -> list[str]:
@@ -4307,12 +4324,7 @@ class PyFlameBuilder(QMainWindow):
         if not self._check_unsaved():
             return
         if not os.path.exists(path):
-            msg = QMessageBox(self)
-            msg.setWindowTitle('File Not Found')
-            msg.setText(f'File not found:\n{path}')
-            msg.setIcon(QMessageBox.NoIcon)
-            msg.setStandardButtons(QMessageBox.Ok)
-            msg.exec()
+            AppMessageDialog.info(self, 'File Not Found', f'File not found:\n{path}')
             files = self._recent_files()
             if path in files:
                 files.remove(path)
@@ -4326,15 +4338,14 @@ class PyFlameBuilder(QMainWindow):
     def _check_unsaved(self) -> bool:
         if not self._dirty:
             return True
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Unsaved Changes')
-        msg.setText('You have unsaved changes. Continue?')
-        msg.setIcon(QMessageBox.NoIcon)
-        msg.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
-        reply = msg.exec()
-        if reply == QMessageBox.Save:
+        reply = AppMessageDialog.save_discard_cancel(
+            self,
+            'Unsaved Changes',
+            'You have unsaved changes. Continue?',
+        )
+        if reply == 'save':
             return self._save()
-        return reply == QMessageBox.Discard
+        return reply == 'discard'
 
     def _new_project_no_prompt(self):
         self._raw_import_code = None
@@ -4466,12 +4477,11 @@ class PyFlameBuilder(QMainWindow):
 
         text = summarize_import_result(imported_windows, skipped_items, target_class)
         if interactive:
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Import Complete')
-            msg.setText(text + '\n\nBeta note: complex/custom widget logic may be skipped in this phase.')
-            msg.setIcon(QMessageBox.NoIcon)
-            msg.setStandardButtons(QMessageBox.Ok)
-            msg.exec()
+            AppMessageDialog.info(
+                self,
+                'Import Complete',
+                text + '\n\nBeta note: complex/custom widget logic may be skipped in this phase.',
+            )
         return True, text
 
     def action_import_existing_script(self):
@@ -4606,28 +4616,29 @@ class PyFlameBuilder(QMainWindow):
         names = [(w.function_name or '').strip() for w in self.windows]
         dupes = sorted({n for n in names if n and names.count(n) > 1})
         if interactive and dupes:
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Duplicate Window Names Detected')
-            msg.setText(
-                'Two or more windows share the same name. This may cause problems in exported scripts.\n\n'
-                f'Duplicates: {", ".join(dupes)}\n\n'
-                'Do you want to continue exporting?'
+            ok = AppMessageDialog.confirm(
+                self,
+                'Duplicate Window Names Detected',
+                'Two or more windows share the same name. This may cause problems in exported scripts.',
+                informative_text=f'Duplicates: {", ".join(dupes)}\n\nDo you want to continue exporting?',
+                confirm_label='Continue',
+                danger=True,
             )
-            msg.setIcon(QMessageBox.NoIcon)
-            msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-            msg.setDefaultButton(QMessageBox.Cancel)
-            if msg.exec() != QMessageBox.Yes:
+            if not ok:
                 return False, 'Export cancelled'
         if interactive and not overwrite:
             snake = to_snake(self.config.script_name)
             script_dir = os.path.join(output_dir, snake)
             if os.path.exists(script_dir):
-                msg = QMessageBox(self)
-                msg.setWindowTitle('Folder Exists')
-                msg.setText(f'A folder named "{snake}" already exists at:\n{output_dir}\n\nOverwrite it?')
-                msg.setIcon(QMessageBox.NoIcon)
-                msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
-                if msg.exec() != QMessageBox.Yes:
+                ok = AppMessageDialog.confirm(
+                    self,
+                    'Folder Exists',
+                    f'A folder named "{snake}" already exists at:\n{output_dir}',
+                    informative_text='Overwrite it?',
+                    confirm_label='Overwrite',
+                    danger=True,
+                )
+                if not ok:
                     return False, 'Export cancelled'
                 effective_overwrite = True
 
@@ -4705,13 +4716,14 @@ class PyFlameBuilder(QMainWindow):
         warnings = self._collect_export_preflight_warnings()
         if not warnings:
             return True
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Export Preflight')
-        msg.setIcon(QMessageBox.Warning)
-        msg.setText('Please review preflight warnings before export:')
-        msg.setInformativeText('\n'.join(f'• {w}' for w in warnings))
-        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
-        return msg.exec() == QMessageBox.Ok
+        return AppMessageDialog.confirm(
+            self,
+            'Export Preflight',
+            'Please review preflight warnings before export:',
+            informative_text='\n'.join(f'• {w}' for w in warnings),
+            confirm_label='Continue',
+            danger=True,
+        )
 
     def _export_ui_code_only(self):
         text = self.preview_text.toPlainText() if hasattr(self, 'preview_text') else ''
@@ -4758,12 +4770,11 @@ class PyFlameBuilder(QMainWindow):
                 QMessageBox.critical(self, 'Error', result)
             return
 
-        msg = QMessageBox(self)
-        msg.setWindowTitle('Script Exported')
-        msg.setText(f'Script exported successfully:\n{result}\n\n(Revealed in Finder)')
-        msg.setIcon(QMessageBox.NoIcon)
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec()
+        AppMessageDialog.info(
+            self,
+            'Script Exported',
+            f'Script exported successfully:\n{result}\n\n(Revealed in Finder)',
+        )
 
     @staticmethod
     def _reveal_in_finder(path: str):

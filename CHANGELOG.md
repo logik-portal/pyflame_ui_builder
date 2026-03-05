@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.1] - 03.05.26
+
+### Fixed
+
+- Misc bugs fixed.
+
 ## [1.1.0] - 03.04.26
 
 ### Added

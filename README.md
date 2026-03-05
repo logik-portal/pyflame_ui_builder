@@ -1,6 +1,6 @@
 # PyFlame UI Builder
 
-**Version:** 1.1.0<br>
+**Version:** 1.1.1<br>
 **Author:** Michael Vaglienty<br>
 **License:** GPL-3.0<br>
 **GitHub:** https://github.com/logik-portal/pyflame-ui-builder<br>
